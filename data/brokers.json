@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "_comment": "Seed roster -- deliberately tiny and hand-checked. Real coverage comes from the CalPrivacy data broker registry plus community contributions. Verify every entry before trusting it; a wrong opt-out URL is worse than a missing one.",
+  "brokers": [
+    {
+      "id": "calprivacy-drop",
+      "name": "California DROP (all registered brokers)",
+      "site": "https://privacy.ca.gov/data-brokers/",
+      "method": "drop",
+      "opt_out_url": "https://privacy.ca.gov/data-brokers/",
+      "opt_out_email": "",
+      "requires_id": true,
+      "recheck_days": 45,
+      "ca_registered": true,
+      "notes": "CA residents only. One request reaches every registered broker; they must poll every 45 days from 2026-08-01. Identity verified through the state gateway. Supersedes contacting registered brokers individually."
+    },
+    {
+      "id": "example-web",
+      "name": "Example People Search",
+      "site": "https://example.com",
+      "method": "web",
+      "opt_out_url": "https://example.com/optout",
+      "opt_out_email": "",
+      "requires_id": false,
+      "recheck_days": 45,
+      "ca_registered": false,
+      "notes": "Placeholder. Shape reference only -- not a real broker."
+    },
+    {
+      "id": "example-mail",
+      "name": "Example Data Co",
+      "site": "https://example.org",
+      "method": "email",
+      "opt_out_url": "",
+      "opt_out_email": "privacy@example.org",
+      "requires_id": false,
+      "recheck_days": 90,
+      "ca_registered": false,
+      "notes": "Placeholder. Shape reference only -- not a real broker."
+    }
+  ]
+}

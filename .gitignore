@@ -1,0 +1,13 @@
+build/
+compile_commands.json
+*.o
+*.swp
+
+# Reference docs live in their own repo -- never vendor them here.
+RULES.md
+CANON.md
+HANDOFF.md
+ARC.md
+ARCHITECTURE.md
+BOOK.md
+docs/

@@ -16,6 +16,8 @@ find_package(PkgConfig REQUIRED)
 # core stays headless-testable.
 add_library(delr_core STATIC
     src/core/Broker.cpp
+    # Table two: the caseload. PII, unlike the roster -- see the header.
+    src/core/Case.cpp
 )
 target_include_directories(delr_core PUBLIC include)
 # Vendored nlohmann/json (header-only, MIT), PRIVATE -- an implementation
@@ -35,6 +37,10 @@ if(GTKMM_FOUND AND spdlog_FOUND)
     add_executable(delr
         src/main.cpp
         src/App.cpp
+        # Follows the desktop's light/dark preference (GTK4 will not do it for
+        # us and we do not link libadwaita). Needs no new dependency: the D-Bus
+        # and GSettings calls are GIO, which gtkmm-4.0 already brings in.
+        src/Appearance.cpp
         src/Shell.cpp
         src/Shell_zones.cpp
         src/Shell_bindings.cpp

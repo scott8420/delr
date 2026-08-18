@@ -35,21 +35,33 @@ void Shell::build_pages() {
     m_roster_page.append(m_roster_scroll);
     m_stack.add(m_roster_page, "roster", "Roster");
 
-    // Cases: the per-user caseload. Deliberately empty -- the model isn't
-    // built yet, and a page that pretends to work would be the un-run
-    // reference CANON warns about.
-    m_cases_label.set_text("No caseload model yet.\n"
-                           "Cases arrive once discovery is a human step and "
-                           "verification is the machine's.");
-    m_cases_label.set_justify(Gtk::Justification::CENTER);
-    m_cases_label.set_vexpand(true);
-    m_cases_page.append(m_cases_label);
+    // Cases: the per-user caseload. Same shape as the roster page on purpose --
+    // status line on top, list below -- because they are the same job with a
+    // different table, and two surfaces that behave alike should be built alike.
+    //
+    // The exposure line sits BETWEEN them rather than in the list, because it
+    // answers a different question: the list says "where", the roll-up says
+    // "what of yours is out there", and that second sentence is the one worth
+    // reading first.
+    m_cases_status.set_xalign(0.0f);
+    m_cases_status.set_margin(8);
+    m_cases_exposure.set_xalign(0.0f);
+    m_cases_exposure.set_margin_start(8);
+    m_cases_exposure.set_margin_end(8);
+    m_cases_exposure.set_margin_bottom(8);
+    m_cases_exposure.set_wrap(true);
+    m_cases_scroll.set_child(m_cases_list);
+    m_cases_scroll.set_vexpand(true);
+    m_cases_page.append(m_cases_status);
+    m_cases_page.append(m_cases_exposure);
+    m_cases_page.append(m_cases_scroll);
     m_stack.add(m_cases_page, "cases", "Cases");
 }
 
 Glib::RefPtr<Gio::Menu> Shell::build_menu() {
     auto menu = Gio::Menu::create();
     menu->append("Reload roster", "win.reload-roster");
+    menu->append("Reload cases",  "win.reload-cases");
     menu->append("Dump registry", "win.dump-registry");
     return menu;
 }

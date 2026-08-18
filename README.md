@@ -55,10 +55,12 @@ Stub. What exists and is exercised:
 
 | Piece | Where | State |
 |---|---|---|
-| Broker roster + JSON pump + validation | `include/core/Broker.hpp`, `src/core/Broker.cpp` | 23 pass / 0 fail |
-| Core checks (`delr --selftest`) | `src/selftest.cpp` | 23 pass / 0 fail, run on demand |
+| Broker roster + JSON pump + validation | `include/core/Broker.hpp`, `src/core/Broker.cpp` | exercised |
+| Caseload: status/outcome/provenance, dates, scheduling, exposure roll-up | `include/core/Case.hpp`, `src/core/Case.cpp` | exercised |
+| Follows the desktop light/dark preference | `include/Appearance.hpp`, `src/Appearance.cpp` | working |
+| Core checks (`delr --selftest`) | `src/selftest.cpp` | 120 pass / 0 fail, run on demand |
 | App shell, sidebar + stack, roster page | `src/Shell*.cpp` | compiles; **unverified visually** |
-| Cases page | — | empty on purpose; no caseload model yet |
+| Cases page: status line, exposure roll-up, case list | `src/Shell_zones.cpp`, `src/Shell_handlers.cpp` | compiles; **unverified visually** |
 
 The GUI has been compiled but never *seen* — there's no display in the
 environment it was built in. Compiling is one channel of evidence; eyes are the
@@ -66,9 +68,15 @@ other, and only the case where both agree counts as working.
 
 ## Next
 
-Caseload model (status, dates, next-check) · roster fetched from a hosted repo
-with a baked-in fallback · the verification check itself · profile storage,
-encrypted at rest.
+Adding a case from the UI (paste a URL) · egress policy (bind first, preflight, fail
+closed) · the verification fetch itself · roster fetched from a hosted repo with
+a baked-in fallback · profile storage, encrypted at rest.
+
+Two invariants the model already enforces, because they cannot be retrofitted
+into a report: **indeterminate never rounds to not-found**, and **who says a
+record is gone is a field**, not a footnote. A broker's claim, a state
+platform's relay of that claim, and our own fetch of the live page are three
+different weights of evidence.
 
 ## Non-negotiables
 

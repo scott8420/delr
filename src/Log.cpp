@@ -4,7 +4,7 @@
 
 namespace delr::log {
 namespace {
-constexpr int kAreaCount = 5;
+constexpr int kAreaCount = 6;
 
 const char* area_name(Area a) {
     switch (a) {
@@ -12,6 +12,7 @@ const char* area_name(Area a) {
         case Area::Shell:    return "shell";
         case Area::Registry: return "registry";
         case Area::Roster:   return "roster";
+        case Area::Cases:    return "cases";
         case Area::Io:       return "io";
     }
     return "?";

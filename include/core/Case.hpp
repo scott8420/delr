@@ -1,0 +1,180 @@
+#pragma once
+#include <string>
+#include <vector>
+
+// ─────────────────────────────────────────────────────────────────────────────
+// core/Case -- table two: what you've asked, when, and where it stands.
+//
+// A case is ONE LISTING, not one broker. Spokeo can hold two records for you
+// under two addresses; those are two cases, checked independently, removed
+// independently. The broker id rides along as a field.
+//
+// A relist opens a NEW case carrying `supersedes` = the old case's id, and the
+// old one ends at Relisted. It is not the old case reopened. Removal happened;
+// the record came back; both facts are true and a single mutable row can only
+// hold one of them. The history is the evidence, and this app exists because
+// nobody else keeps it.
+//
+// GTK-free and headless-testable. The caller resolves the path (the seam).
+// Encode and decode live in one file so a write can't skew from its read.
+//
+// ── PII WARNING, load-bearing ────────────────────────────────────────────────
+// Unlike the roster, THIS TABLE IS PII. `url` in particular is PII all by
+// itself -- `spokeo.com/John-Smith/Tennessee/...` carries a name and a state in
+// the path -- so the no-PII-in-logs rule extends to URLs. Log `id`, log the
+// outcome, never log `url`, `note`, or the exposure list. `log_ref()` exists to
+// make the safe thing the easy thing.
+//
+// This file is also the thing encryption-at-rest has to protect. The pump takes
+// a plain path today; when the crypto stone lands it swaps underneath, which is
+// why nothing above core:: is allowed to know the on-disk shape.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace delr::core {
+
+// ── What we believe about this listing ───────────────────────────────────────
+// The lifecycle. Distinct from Outcome below: Status is the case's standing,
+// Outcome is what the last fetch literally saw. They are different axes and
+// collapsing them is how "we couldn't look" becomes "you're clean".
+enum class Status {
+    Found,      // you found it; nothing asked yet
+    Requested,  // opt-out sent, awaiting effect
+    Removed,    // believed gone -- see Provenance for who says so
+    Relisted,   // was removed, came back; terminal (a new case supersedes)
+    Abandoned,  // deliberately stopped chasing
+    Unknown
+};
+
+// ── Who says it's gone ───────────────────────────────────────────────────────
+// The whole point of the app. A broker's dashboard tick and our own fetch of
+// the live page are not the same claim, and a report that renders them
+// identically is lying by omission.
+enum class Provenance {
+    None,          // nobody has claimed anything
+    BrokerClaim,   // the broker says so
+    PlatformClaim, // a state platform (DROP) relays the broker's declaration
+    SelfVerified   // WE fetched the page and it was gone. The only evidence.
+};
+
+// ── What the last check actually saw ─────────────────────────────────────────
+enum class Outcome {
+    Listed,        // the record is there
+    NotFound,      // fetched cleanly, record absent
+    Indeterminate, // we could not look. NEVER rounds to NotFound.
+    Never          // no check has run yet
+};
+
+// Why a check was indeterminate. A bare "failed" is unactionable; these
+// distinguish "the site blocked us" from "our own tunnel was down", which are
+// different bugs with different fixes.
+enum class Reason {
+    None,
+    NoTunnel,      // egress preflight refused -- we declined to expose ourselves
+    Blocked,       // 403 / bot wall
+    Captcha,
+    RateLimited,
+    Timeout,
+    BadResponse,   // 5xx, truncated, unparseable
+    UrlDead        // 404 on the URL itself: gone, or moved. Ambiguous by nature.
+};
+
+// ── What this listing exposes ────────────────────────────────────────────────
+// Observed on YOUR listing, not inherited from the roster's description of what
+// a broker typically holds. The report aggregates on this axis, because "your
+// phone is on nine sites" is the sentence that tells you where the exposure is.
+enum class Field {
+    Name, Aliases, Age, Dob, Address, AddressHistory,
+    Phone, Email, Relatives, Employer, Other
+};
+
+const char* status_name(Status s);      Status     status_from(const std::string& s);
+const char* provenance_name(Provenance p); Provenance provenance_from(const std::string& s);
+const char* outcome_name(Outcome o);    Outcome    outcome_from(const std::string& s);
+const char* reason_name(Reason r);      Reason     reason_from(const std::string& s);
+const char* field_name(Field f);        Field      field_from(const std::string& s);
+
+// ── Dates ────────────────────────────────────────────────────────────────────
+// ISO "YYYY-MM-DD", stored as text so the file stays readable and diffable, and
+// so no time library leaks into the core. Days-precision on purpose: this app
+// schedules on a 45-day rhythm, and a timestamp would imply a precision the
+// evidence does not have.
+bool date_valid(const std::string& iso);
+// Calendar-correct day arithmetic (leap years included). Empty/invalid in,
+// empty out -- never a silently wrong date.
+std::string date_add_days(const std::string& iso, int days);
+// <0, 0, >0. Invalid dates sort before valid ones rather than throwing.
+int date_compare(const std::string& a, const std::string& b);
+
+struct Case {
+    std::string id;          // stable slug, unique within the caseload
+    std::string broker_id;   // -> Broker::id in the roster
+    std::string url;         // PII. The listing itself. Never logged.
+
+    Status     status     = Status::Found;
+    Provenance provenance = Provenance::None;
+
+    // Last check, and only the last -- the run history is a separate concern
+    // and deliberately not modelled yet.
+    Outcome outcome = Outcome::Never;
+    Reason  reason  = Reason::None;
+
+    // first_seen   -- when YOU found the listing
+    // requested    -- when the opt-out went out
+    // last_attempt -- when we last TRIED, however it went
+    // last_verified-- when we last fetched cleanly. The one that means anything.
+    // next_check   -- when it comes due
+    std::string first_seen, requested, last_attempt, last_verified, next_check;
+
+    int consecutive_failures = 0;  // resets on any clean fetch, either way
+
+    std::vector<Field> exposes;    // observed on this listing
+    std::string supersedes;        // the case this one replaces, after a relist
+    std::string note;              // PII-adjacent by assumption. Never logged.
+};
+
+using Caseload = std::vector<Case>;
+
+const Case* caseload_find(const Caseload& c, const std::string& id);
+
+// Cases due on or before `today`, oldest-due first. Abandoned and Relisted are
+// skipped: both are terminal, and re-checking them forever would be the app
+// generating traffic about records it has stopped tracking.
+std::vector<const Case*> caseload_due(const Caseload& c, const std::string& today);
+
+// Exposure by field across live cases -- the report's spine. Counts each field
+// once per case; Removed cases are excluded (that exposure is closed) unless
+// `include_removed`. Sorted by count, descending, then by field for stability.
+struct FieldCount { Field field; int count; };
+std::vector<FieldCount> exposure_by_field(const Caseload& c, bool include_removed = false);
+
+// Apply a check result: sets outcome/reason, moves the dates, bumps or clears
+// the failure count, and schedules the next check `recheck_days` out. Does NOT
+// touch `status` -- believing a record is gone is a judgment, and one clean
+// NotFound is evidence toward it rather than the thing itself. Returns the
+// updated case; pure, so the selftest can assert on it without a filesystem.
+Case apply_check(const Case& c, Outcome o, Reason r,
+                 const std::string& today, int recheck_days);
+
+// Open the successor to a relisted case: same broker and URL, new id, status
+// Found, provenance cleared, `supersedes` wired. The caller ends the old one.
+Case relist_successor(const Case& old, const std::string& new_id,
+                      const std::string& today);
+
+// Safe log identifier -- "case:<id>@<broker_id>". Carries no URL, no note, no
+// field list. Anything that logs a case logs THIS.
+std::string log_ref(const Case& c);
+
+// Validation. Guards the invariants the report depends on, loudly:
+//   - ids present and unique; broker_id and url present
+//   - every date well-formed, and ordered (first_seen <= requested <= ...)
+//   - Indeterminate carries a Reason; every other outcome carries none
+//   - Removed carries a Provenance, and SelfVerified requires a last_verified
+//   - Relisted carries a successor's supersedes elsewhere -- not checkable here
+//   - consecutive_failures >= 0
+std::vector<std::string> caseload_validate(const Caseload& c);
+
+// Persistence pump. First-run tolerant: a missing file is an empty caseload,
+// not an error. Malformed JSON yields empty and reports via `error`.
+Caseload caseload_load(const std::string& file, std::string* error = nullptr);
+bool     caseload_save(const std::string& file, const Caseload& c);
+
+}  // namespace delr::core

@@ -16,7 +16,10 @@ Shell::Shell()
       m_roster_scroll("shell.roster.scroll"),
       m_roster_list("shell.roster.list"),
       m_cases_page("shell.cases", Gtk::Orientation::VERTICAL),
-      m_cases_label("shell.cases.label") {
+      m_cases_status("shell.cases.status"),
+      m_cases_exposure("shell.cases.exposure"),
+      m_cases_scroll("shell.cases.scroll"),
+      m_cases_list("shell.cases.list") {
     set_name("shell");
 }
 
@@ -30,6 +33,7 @@ void Shell::build_ui() {
     build_pages();
     bind_actions();
     on_reload_roster();   // first paint from disk
+    on_reload_cases();
 }
 
 }  // namespace delr

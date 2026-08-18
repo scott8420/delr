@@ -11,7 +11,7 @@
 // terminal scrollback has defeated itself.
 namespace delr::log {
 
-enum class Area { App, Shell, Registry, Roster, Io };
+enum class Area { App, Shell, Registry, Roster, Cases, Io };
 
 std::shared_ptr<spdlog::logger> get(Area area);
 void init();

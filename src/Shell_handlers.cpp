@@ -7,6 +7,8 @@
 #include <glibmm/miscutils.h>
 #include <glibmm/datetime.h>
 #include <gtkmm/label.h>
+#include "Paths.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -14,12 +16,17 @@
 
 namespace delr {
 
-// UI-side path resolution: DELR_ROSTER wins, else ./data/brokers.json beside
-// the working directory. The core never learns where the file came from.
-std::string Shell::roster_file() const {
-    if (const char* env = std::getenv("DELR_ROSTER")) return env;
-    return Glib::build_filename(Glib::get_current_dir(), "data", "brokers.json");
-}
+// Path resolution moved to `paths` in s12; these three stay as members so
+// every call site in the Shell reads the same as it did, and so the core still
+// never learns where a file came from. What changed is underneath: the roster
+// and the rules are ASSETS and still sit beside the program, while the
+// caseload and the policy are STATE and no longer do.
+std::string Shell::roster_file() const { return paths::roster_file(); }
+
+// Quit by closing the window rather than by asking the application to quit:
+// the destructor is what hides the two member dialogs and joins the worker, and
+// close() is what runs it. `Gtk::Application` exits when its last window goes.
+void Shell::on_quit() { close(); }
 
 void Shell::on_reload_roster() {
     const std::string file = roster_file();
@@ -49,30 +56,39 @@ void Shell::on_reload_roster() {
         m_roster_list.append(*row);
     }
 
-    if (!err.empty())
+    // The caption under the explainer, and it now says what the table IS and
+    // what its tags MEAN. The tags were the last unexplained thing on the
+    // page: `[web]` and `[drop]` are the difference between "fill in a form"
+    // and "one state platform does it for every broker registered there", and
+    // a user who cannot tell them apart cannot do step 2.
+    //
+    // The absolute path moved to the tooltip. It is the right answer to "which
+    // file is this" and the wrong opening line for a page explaining what the
+    // program is -- this is an ASSET, the same on every machine, so its
+    // location is a maintenance detail rather than something to lead with.
+    if (!err.empty()) {
         m_roster_status.set_text("Roster failed to parse: " + err);
-    else
+    } else {
         m_roster_status.set_text(
-            std::to_string(m_roster.size()) + " broker(s) from " + file +
-            (problems.empty() ? "" : "  --  " + std::to_string(problems.size()) +
+            std::to_string(m_roster.size()) +
+            " broker(s) delr knows how to reach.   [web] a form you fill in "
+            "   [email] a message you send   [drop] California's platform, "
+            "which relays to every broker registered there." +
+            (problems.empty() ? "" : "   --   " + std::to_string(problems.size()) +
                                      " validation problem(s), see log"));
+    }
+    m_roster_status.set_tooltip_text(file);
 }
 
-// The caseload's path. Same reasoning as the roster's, different table -- and
-// unlike the roster this file is PII, so when encryption-at-rest lands it lands
-// behind core::caseload_load and this line does not change.
-std::string Shell::cases_file() const {
-    if (const char* env = std::getenv("DELR_CASES")) return env;
-    return Glib::build_filename(Glib::get_current_dir(), "data", "cases.json");
-}
+// The caseload's path. Unlike the roster this file is PII -- it is a list of
+// pages that expose this user, by URL -- so it lives under XDG rather than in
+// the tree, and when encryption-at-rest lands it lands behind
+// core::caseload_load and this line does not change.
+std::string Shell::cases_file() const { return paths::cases_file(); }
 
-// Table three's path. Same shape as the two above; its own env override
-// because it is its own file, and it is its own file because it rots on a
-// designer's schedule rather than a company's.
-std::string Shell::rules_file() const {
-    if (const char* env = std::getenv("DELR_RULES")) return env;
-    return Glib::build_filename(Glib::get_current_dir(), "data", "pagerules.json");
-}
+// Table three's path. An asset like the roster, and its own file because it
+// rots on a designer's schedule rather than a company's.
+std::string Shell::rules_file() const { return paths::rules_file(); }
 
 void Shell::on_reload_rules() {
     const std::string file = rules_file();
@@ -337,14 +353,11 @@ void Shell::on_case_committed(core::Case fresh) {
 // caseload this file is PII -- it holds `naked_exit` -- and the pump writes it
 // 0600 for that reason. Path resolution stays here because path resolution is
 // the UI's job, which is the same seam that keeps the clock out of the core.
-std::string Shell::egress_file() const {
-    // Deferred to `netcheck::policy_path()` rather than repeated here, so
-    // `delr --netcheck` with no arguments reads the same file this window
-    // writes. Two definitions of a default path is two programs.
-    const std::string p = netcheck::policy_path();
-    if (Glib::path_is_absolute(p)) return p;
-    return Glib::build_filename(Glib::get_current_dir(), p);
-}
+// The absolute-path dance this used to do is gone with the relative default
+// that made it necessary: `paths::egress_file` is absolute or it is empty, and
+// empty means there is no home to write to, which is a refusal rather than
+// something to paper over with the working directory.
+std::string Shell::egress_file() const { return paths::egress_file(); }
 
 void Shell::on_reload_egress() {
     std::string err;

@@ -12,8 +12,10 @@
 #include "core/Intake.hpp"
 #include "core/PageRules.hpp"
 #include "core/Probe.hpp"
+#include "core/RosterImport.hpp"
 #include "net/Fetch.hpp"
 #include "net/Observer.hpp"
+#include "Paths.hpp"
 
 #include <cstdio>
 #include <algorithm>
@@ -137,6 +139,12 @@ int run() {
     src[0].recheck_days = 30;
     src[2].ca_registered = true;
     src[1].notes = "responds slowly";
+    // The host list and the two registry flags ride the same pump and must not
+    // be able to skew from it -- a field added to the struct and forgotten in
+    // encode is a field that silently empties on every save.
+    src[0].hosts = {"spokeo.example", "thatsthem.example"};
+    src[1].fcra_regulated = true;
+    src[2].collects_geo = true;
 
     check(roster_save(f, src), "save writes the file");
 
@@ -154,7 +162,9 @@ int run() {
                     a.opt_out_email == b.opt_out_email &&
                     a.requires_id == b.requires_id &&
                     a.recheck_days == b.recheck_days &&
-                    a.ca_registered == b.ca_registered && a.notes == b.notes;
+                    a.ca_registered == b.ca_registered && a.notes == b.notes &&
+                    a.hosts == b.hosts && a.fcra_regulated == b.fcra_regulated &&
+                    a.collects_geo == b.collects_geo;
     }
     check(identical, "every field survives the round trip");
     check(roster_validate(back).empty(), "the reloaded roster validates");
@@ -2199,6 +2209,345 @@ int run() {
                   "and a readable one comes back verbatim, for the core to judge");
             std::remove(rf.c_str());
         }
+    }
+
+
+    // ── where files live ─────────────────────────────────────────────────────
+    // These functions read the environment, so the checks WRITE the
+    // environment and put it back. That is why `paths` uses getenv rather than
+    // g_get_user_data_dir: glib caches its answer on first call, and a check
+    // that sets XDG_DATA_HOME would get the answer from before the check ran.
+    {
+        std::printf("\npaths (assets beside the program, state under XDG)\n");
+        namespace P = delr::paths;
+
+        struct Saved {
+            const char* name; std::string val; bool had;
+            explicit Saved(const char* n) : name(n) {
+                const char* v = std::getenv(n);
+                had = (v != nullptr);
+                if (had) val = v;
+            }
+            ~Saved() {
+                if (had) ::setenv(name, val.c_str(), 1); else ::unsetenv(name);
+            }
+        };
+        Saved s_state("DELR_STATE"), s_xdg("XDG_DATA_HOME"), s_home("HOME"),
+              s_cases("DELR_CASES"), s_egress("DELR_EGRESS"),
+              s_roster("DELR_ROSTER"), s_rules("DELR_RULES"),
+              s_assets("DELR_ASSETS");
+        for (const char* n : {"DELR_STATE", "XDG_DATA_HOME", "HOME",
+                              "DELR_CASES", "DELR_EGRESS", "DELR_ROSTER",
+                              "DELR_RULES", "DELR_ASSETS"})
+            ::unsetenv(n);
+
+        // The refusal, first, because it is the interesting one. With no home
+        // of any kind there is no fourth guess that is not worse than saying
+        // so -- the working directory is the bug this module removed.
+        check(P::state_dir().empty(),
+              "with no DELR_STATE, no XDG_DATA_HOME and no HOME there is no state dir");
+        check(P::cases_file().empty() && P::egress_file().empty(),
+              "and the state files are empty rather than relative to nowhere");
+        std::string derr;
+        check(!P::ensure_state_dir(&derr) && !derr.empty(),
+              "ensure refuses, with a sentence rather than a silent false");
+
+        ::setenv("HOME", "/home/nobody", 1);
+        check(P::state_dir() == "/home/nobody/.local/share/delr",
+              "HOME alone gives the XDG default location");
+        check(P::cases_file() == "/home/nobody/.local/share/delr/cases.json",
+              "and the caseload sits inside it");
+
+        ::setenv("XDG_DATA_HOME", "/xdg", 1);
+        check(P::state_dir() == "/xdg/delr", "XDG_DATA_HOME outranks HOME");
+        ::setenv("DELR_STATE", "/override", 1);
+        check(P::state_dir() == "/override", "and DELR_STATE outranks both");
+
+        // Set-but-empty is not an answer. `DELR_CASES=` in a shell profile
+        // would otherwise resolve to the empty path and every save would fail
+        // at open() with nothing to read about why.
+        ::setenv("DELR_STATE", "", 1);
+        check(P::state_dir() == "/xdg/delr",
+              "an empty variable is unset, not an empty path");
+        ::unsetenv("DELR_STATE");
+
+        ::setenv("DELR_CASES", "/tmp/somewhere/else.json", 1);
+        check(P::cases_file() == "/tmp/somewhere/else.json",
+              "a per-file override wins outright");
+        check(P::egress_file() == "/xdg/delr/egress.json",
+              "and moves only its own file, not its neighbours");
+        ::unsetenv("DELR_CASES");
+
+        // Assets are the OTHER kind of file and do not follow state anywhere.
+        // The roster and the rules are downloaded, identical on every machine,
+        // and belong in git; putting them under XDG would mean a user's home
+        // holding a copy of something the repo already ships.
+        ::setenv("DELR_ASSETS", "/opt/delr/data", 1);
+        check(P::roster_file() == "/opt/delr/data/brokers.json" &&
+                  P::rules_file() == "/opt/delr/data/pagerules.json",
+              "assets resolve against the asset dir, not the state dir");
+        ::setenv("XDG_DATA_HOME", "/elsewhere", 1);
+        check(P::roster_file() == "/opt/delr/data/brokers.json",
+              "and moving the state dir does not move them");
+        ::unsetenv("DELR_ASSETS");
+
+        // ── the migration ────────────────────────────────────────────────────
+        const std::string mdir = tmp_path("delr_selftest_paths");
+        std::error_code mec;
+        std::filesystem::remove_all(mdir, mec);
+        std::filesystem::create_directories(mdir + "/old", mec);
+        std::filesystem::create_directories(mdir + "/new", mec);
+        const std::string from = mdir + "/old/egress.json";
+        const std::string to   = mdir + "/new/egress.json";
+
+        check(P::migrate_one(from, to) == P::Migration::NothingToDo,
+              "nothing to migrate when the legacy file is not there");
+
+        { std::ofstream o(from); o << "{\"version\":1}\n"; }
+        std::filesystem::permissions(
+            from,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace, mec);
+        check(P::migrate_one(from, to) == P::Migration::Moved,
+              "a legacy file moves to the new location");
+        check(!std::filesystem::exists(from),
+              "and STOPS EXISTING at the old one -- a move that leaves a copy "
+              "in the source tree has not fixed anything");
+        check(std::filesystem::exists(to), "and is readable at the new one");
+        // 0600 has to survive the move. Re-applying it afterwards would leave
+        // a window in which naked_exit is on disk world-readable.
+        const auto mperm = std::filesystem::status(to, mec).permissions();
+        check((mperm & std::filesystem::perms::group_read) ==
+                      std::filesystem::perms::none &&
+                  (mperm & std::filesystem::perms::others_read) ==
+                      std::filesystem::perms::none,
+              "with its mode intact, so 0600 is never briefly not 0600");
+
+        // Both present: the new one wins and the old one is LEFT. Deleting a
+        // file the user might want is not recoverable, and this function does
+        // not get to make that call quietly.
+        { std::ofstream o(from); o << "{\"version\":1,\"older\":true}\n"; }
+        check(P::migrate_one(from, to) == P::Migration::KeptTarget,
+              "when both exist the new location wins");
+        check(std::filesystem::exists(from),
+              "and the older copy is left rather than deleted behind the user's back");
+        std::filesystem::remove_all(mdir, mec);
+    }
+
+
+    // ── the registry importer ────────────────────────────────────────────────
+    // A fixture rather than the real 337KB export: hermetic, and it can hold
+    // the awkward shapes on purpose. Every oddity below was found in the 2025
+    // file, including the non-breaking space in the first header.
+    {
+        std::printf("\ncsv parsing (as encountered, not as specified)\n");
+
+        const std::string bom = "\xEF\xBB\xBF";
+        const std::string fixture =
+            bom + ",annotation band the agency writes for its own website,,,,\r\n"
+            "Data broker name:,Data broker primary website:,"
+            "Data broker primary contact email address:,"
+            "Data Broker's primary website that contains details on how consumers can "
+            "exercise their CA Consumer Privacy Act rights:,"
+            "The data broker or any of its subsidiaries is regulated by the federal Fair "
+            "Credit Reporting Act (FCRA):,"
+            "The data broker collects consumers\xE2\x80\x99 precise geolocation: \r\n"
+            "Alpha People Search,https://www.alpha.example,privacy@alpha.example,"
+            "https://alpha.example/rights,No,Yes\r\n"
+            "\"Beta, Inc. and its affiliates\",\"https://www.beta.example;\n"
+            "https://www.betalookup.example; \nhttps://www.betaphone.example\","
+            "privacy@beta.example,https://beta.example/rights,Yes,No\r\n"
+            "Beta Screening LLC,https://www.beta.example,screening@beta.example,"
+            "https://beta.example/rights,Yes,No\r\n"
+            "Gamma Data,https://www.gamma.example,\"legal@gamma.example; "
+            "second@gamma.example\",https://gamma.example/rights,No,No\r\n"
+            "\"Delta \"\"The\"\" Co\",https://www.delta.example,privacy@delta.example,"
+            "https://delta.example/rights,No,No";
+
+        const CsvTable t = csv_parse(fixture);
+        check(t.size() == 7, "every row is seen, including the last with no newline");
+        check(t[1][0] == "Data broker name:",
+              "the BOM is stripped rather than becoming part of the first header");
+        check(t[3][1].find("betalookup") != std::string::npos,
+              "a newline inside quotes stays inside the field");
+        check(t[3][0] == "Beta, Inc. and its affiliates",
+              "a comma inside quotes is not a column break");
+        check(t[6][0] == "Delta \"The\" Co", "a doubled quote is one literal quote");
+
+        std::printf("\nheader matching (text, never column index)\n");
+        // The header the real file ships has a UTF-8 non-breaking space inside
+        // it -- invisible everywhere, and it made the importer refuse the
+        // state's own export until squash() started treating any non-ASCII
+        // byte as a gap. This is that bug, pinned.
+        std::string nbsp_fixture = fixture;
+        const std::size_t at = nbsp_fixture.find("Data broker name:");
+        nbsp_fixture.replace(at, 17, "Data broker\xC2\xA0name:");
+        ImportReport nrep;
+        const Roster nr = registry_parse(nbsp_fixture, nrep);
+        check(nrep.failure.empty() && nr.size() == 5,
+              "a non-breaking space inside a header does not hide the column");
+
+        ImportReport srep;
+        registry_parse("no,header,here\n1,2,3\n", srep);
+        check(!srep.failure.empty(),
+              "a file that is not the registry is refused, not half-read");
+
+        std::printf("\nregistry rows become brokers\n");
+        ImportReport rep;
+        const Roster in = registry_parse(fixture, rep);
+        check(rep.failure.empty(), "the fixture parses");
+        check(rep.rows_read == 5 && in.size() == 5, "one entry per registrant");
+        check(rep.rows_skipped == 0, "no registrant is dropped");
+
+        const Broker* beta = nullptr;
+        for (const auto& b : in) if (b.name.rfind("Beta,", 0) == 0) beta = &b;
+        check(beta != nullptr && beta->hosts.size() == 3,
+              "a registrant filing three domains in one cell gets three hosts");
+        check(rep.multi_host_rows == 1, "and is counted as publishing under more than one");
+        check(beta != nullptr && beta->site == "https://www.beta.example",
+              "the first filed URL is the display homepage");
+
+        // The sibling filer. Beta Screening is a separate company at Beta's
+        // domain, and dropping it would delete a registrant that receives its
+        // own requests at its own address.
+        const Broker* screen = nullptr;
+        for (const auto& b : in) if (b.name.rfind("Beta Screening", 0) == 0) screen = &b;
+        check(screen != nullptr, "a registrant whose only domain is taken is still listed");
+        check(screen != nullptr && screen->hosts.empty(),
+              "with no host of its own, so the first filer keeps the match");
+        check(rep.shared_host_rows == 1, "and the sharing is reported rather than silent");
+        check(screen != nullptr && screen->opt_out_email == "screening@beta.example",
+              "and remains contactable at its own address");
+
+        const Broker* gamma = nullptr;
+        for (const auto& b : in) if (b.name == "Gamma Data") gamma = &b;
+        check(gamma != nullptr && gamma->opt_out_email == "legal@gamma.example",
+              "two addresses in one cell yields the first, not a string with a "
+              "semicolon in it");
+
+        check(in[0].method == Method::Email,
+              "method is email: it is the channel that works from any state");
+        check(!in[0].opt_out_url.empty(), "and the rights URL rides along regardless");
+        check(in[0].ca_registered, "every row of this file is a CA registrant");
+        check(in[0].collects_geo && !in[0].fcra_regulated,
+              "the two declared flags are read from their own columns");
+        check(beta != nullptr && beta->fcra_regulated,
+              "the FCRA declaration is read, not one of the four follow-up columns");
+        check(roster_validate(in).empty(), "the imported roster validates");
+
+        std::printf("\nids (stable across a refresh, or cases orphan)\n");
+        check(in[0].id == "alpha", "an id is the domain stem, not the TLD");
+        check(screen != nullptr && !screen->id.empty() && screen->id != beta->id,
+              "two registrants at one domain do not collide on one id");
+        std::vector<std::string> taken{"acme"};
+        check(mint_id("acme.com", "Acme Two LLC", taken) == "acme-acme-two-llc",
+              "a collision is broken by the registrant's name, which reads in a log");
+        taken.push_back("acme-acme-two-llc");
+        check(mint_id("acme.com", "Acme Two LLC", taken) == "acme-2",
+              "and by an ordinal when the names are identical too");
+
+        std::printf("\nsplitting a cell full of URLs\n");
+        check(split_urls("https://a.example; \nhttps://b.example").size() == 2,
+              "semicolons and newlines both separate");
+        check(split_urls("https://a.example\nhttps://b.example").size() == 2,
+              "and so does a bare newline with no punctuation");
+        check(split_urls("   ").empty(), "an empty cell yields nothing");
+        check(import_host_of("https://www.Alpha.example/x") == "alpha.example",
+              "hosts are minted in the SAME normal form the matcher compares");
+
+        std::printf("\nmerge (the second run is the one that can do damage)\n");
+        Roster hand;
+        Broker drop;
+        drop.id = "calprivacy-drop";
+        drop.name = "California DROP";
+        drop.site = "https://privacy.ca.gov/data-brokers/";
+        drop.method = Method::Drop;
+        drop.notes = "hand written";
+        hand.push_back(drop);
+
+        ImportReport m1;
+        const Roster first = roster_merge(hand, in, m1);
+        check(first.size() == 6, "the hand-written entry and every registrant survive");
+        check(m1.merged_new == 5 && m1.merged_kept == 1,
+              "an entry this registry does not mention is KEPT, never deleted");
+
+        ImportReport m2;
+        const Roster second = roster_merge(first, in, m2);
+        check(m2.merged_new == 0 && m2.merged_updated == 5,
+              "re-importing the same file adds nothing -- it updates in place");
+        check(m2.merged_renamed == 0, "and renames nothing");
+        check(second.size() == first.size(), "so the roster does not grow every year");
+
+        bool ids_held = second.size() == first.size();
+        for (std::size_t i = 0; ids_held && i < first.size(); ++i)
+            ids_held = first[i].id == second[i].id;
+        check(ids_held,
+              "every id survives the refresh -- a re-minted id orphans every case "
+              "filed against that broker");
+
+        // The rename. A registrant filing under a new legal name is the exact
+        // case that must NOT mint a new id.
+        Roster renamed = in;
+        renamed[0].name = "Alpha People Search LLC";
+        ImportReport m3;
+        const Roster after = roster_merge(first, renamed, m3);
+        check(m3.merged_renamed == 1 && m3.merged_new == 0,
+              "a renamed registrant is matched by host, not by name");
+        const Broker* still = roster_find(after, "alpha");
+        check(still != nullptr && still->name == "Alpha People Search LLC",
+              "so the id holds while the name updates");
+
+        // Human fields are the human's. The state does not know them and a
+        // refresh must not blank them.
+        Roster annotated = first;
+        for (auto& b : annotated)
+            if (b.id == "alpha") { b.notes = "wants a photo ID"; b.requires_id = true;
+                                   b.recheck_days = 90; }
+        ImportReport m4;
+        const Roster kept = roster_merge(annotated, in, m4);
+        const Broker* a2 = roster_find(kept, "alpha");
+        check(a2 != nullptr && a2->notes == "wants a photo ID" && a2->requires_id &&
+                  a2->recheck_days == 90,
+              "notes, requires_id and recheck_days survive a refresh untouched");
+
+        // A roster written before Broker::hosts existed has everything in
+        // `site`. It must be adopted by its registry row rather than duplicated.
+        Roster legacy;
+        Broker old;
+        old.id = "alpha-legacy";
+        old.name = "Alpha";
+        old.site = "https://alpha.example";
+        old.method = Method::Web;
+        old.opt_out_url = "https://alpha.example/optout";
+        legacy.push_back(old);
+        ImportReport m5;
+        const Roster upgraded = roster_merge(legacy, in, m5);
+        check(m5.merged_new == 4 && m5.merged_updated == 1,
+              "a pre-hosts entry is adopted by its registry row, not duplicated");
+        const Broker* up = roster_find(upgraded, "alpha-legacy");
+        check(up != nullptr && up->hosts.size() == 1,
+              "and gains the host list it never had, keeping its own id");
+
+        std::printf("\nmatching, which is what the host list is FOR\n");
+        const Roster r = first;
+        const Broker* hit = broker_for_url(r, "https://www.betalookup.example/John-Smith/TN");
+        check(hit != nullptr && hit->name.rfind("Beta,", 0) == 0,
+              "a listing on a registrant's OTHER domain matches that registrant");
+        check(broker_for_url(r, "https://search.betaphone.example/x") != nullptr,
+              "and so does a subdomain of one");
+        check(broker_for_url(r, "https://notbeta.example/x") == nullptr,
+              "while a host that merely ends the same way does not");
+
+        std::printf("\nvalidation guards the lookup table\n");
+        Roster dup = in;
+        dup[0].hosts.push_back(dup[1].hosts.front());
+        check(!roster_validate(dup).empty(),
+              "two entries claiming one host is caught -- otherwise the match is "
+              "decided by roster order");
+        Roster badhost = in;
+        badhost[0].hosts.push_back("https://alpha.example/x");
+        check(!roster_validate(badhost).empty(),
+              "a URL where a bare hostname belongs is caught, not left to never match");
     }
 
     std::printf("\n%d pass / %d fail\n", g_pass, g_fail);

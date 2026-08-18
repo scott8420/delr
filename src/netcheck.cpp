@@ -1,4 +1,5 @@
 #include "netcheck.hpp"
+#include "Paths.hpp"
 
 #include "core/Egress.hpp"
 #include "core/Probe.hpp"
@@ -143,13 +144,11 @@ int observe_and_report(const core::EgressPolicy& p) {
 
 }  // namespace
 
-std::string policy_path() {
-    if (const char* env = std::getenv("DELR_EGRESS")) return env;
-    // Beside the working directory, like the roster and the caseload. The app
-    // resolves it by calling THIS, so there is one definition of the default
-    // rather than two that can drift.
-    return "data/egress.json";
-}
+// s12 resolved the open decision this function was: it was the wrong home for
+// a shared default, and it held that default only because two callers did not
+// earn a module. Four callers and a migration do. It stays as a name because
+// `--netcheck` prints it and the flag is documented.
+std::string policy_path() { return paths::egress_file(); }
 
 int run_saved() {
     std::string err;

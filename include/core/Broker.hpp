@@ -36,13 +36,60 @@ Method      method_from(const std::string& s);
 struct Broker {
     std::string id;              // stable slug, e.g. "spokeo"
     std::string name;            // display name
-    std::string site;            // homepage
+    std::string site;            // homepage -- the one shown to a human
+
+    // ── One registrant, many sites ───────────────────────────────────────────
+    // `site` is the display homepage; `hosts` is every domain this ONE company
+    // publishes listings under. They are not the same thing and conflating
+    // them breaks the app on precisely the brokers it exists for.
+    //
+    // The CPPA registry proves it: BeenVerified registers twelve domains
+    // (peoplelooker, ownerly, neighborwho, numberguru...) in a single row, and
+    // Mississippi Tornado Alley registers ten (fastpeoplesearch, usphonebook,
+    // searchpeoplefree...). Seven registrants between them carry ~37 listing
+    // domains. Those seven are almost exactly the people-search brokers -- the
+    // rows with pages a person can be FOUND on, which is to say the rows the
+    // verification half of this program is for.
+    //
+    // The alternative -- one Broker per domain -- is wrong in the other
+    // direction. Twelve BeenVerified entries means twelve opt-out emails to
+    // one inbox for one legal entity that a single request already covers. The
+    // registrant is the unit that receives a request; the host is the unit
+    // that gets matched. So: one entry, many hosts.
+    //
+    // `site`'s host is matched too and does not need repeating here, though a
+    // duplicate is harmless -- matching takes the best hit, not the first.
+    std::vector<std::string> hosts;
+
     Method      method = Method::Unknown;
     std::string opt_out_url;     // for Method::Web
     std::string opt_out_email;   // for Method::Email
     bool        requires_id = false;   // demands a photo ID upload
     int         recheck_days = 45;     // how often to re-verify a removal
     bool        ca_registered = false; // on the CalPrivacy data broker registry
+
+    // ── Two facts the registry states that change what the USER does ─────────
+    // Registrants declare a dozen attributes and most are compliance trivia.
+    // These two are not:
+    //
+    // `fcra_regulated` -- an FCRA-regulated broker may LAWFULLY refuse to
+    // delete. A refusal from one of these is a correct outcome, not a failed
+    // request, and a tool that reports it as failure teaches the user to
+    // distrust the tool rather than to understand the law. 18 of 543 declare
+    // it.
+    //
+    // `collects_geo` -- precise geolocation. This is the attribute that
+    // decides whether a listing is an annoyance or a safety problem, and it is
+    // the one a person fleeing someone needs surfaced first. 88 of 543 declare
+    // it.
+    //
+    // Minors and reproductive-health collection are also declared and are
+    // deliberately NOT carried: both are grounds for outrage and neither
+    // changes what this app does about a listing. A field that cannot change
+    // an action is a field that rots.
+    bool        fcra_regulated = false;
+    bool        collects_geo   = false;
+
     std::string notes;
 };
 

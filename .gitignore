@@ -3,6 +3,17 @@ compile_commands.json
 *.o
 *.swp
 
+# User state, which is the whole reason this app exists and must never be in
+# a commit. NOT `data/` wholesale -- brokers.json and pagerules.json are
+# download-only assets and belong in git. These three are what the RUNNING app
+# writes, and one of them (egress.json) holds naked_exit: the user's address
+# with the tunnel DOWN. A privacy tool that publishes the recorded location it
+# exists to protect would be the worst bug this project could ship, and until
+# s12 moved state out of the tree it was one `git add -A` away.
+data/egress.json
+data/cases.json
+data/*.log
+
 # Reference docs live in their own repo -- never vendor them here.
 RULES.md
 CANON.md
@@ -11,12 +22,3 @@ ARC.md
 ARCHITECTURE.md
 BOOK.md
 docs/
-
-# User state, which is the whole reason this app exists and must never be in a
-# commit. NOT `data/` wholesale -- brokers.json and pagerules.json are
-# download-only assets and belong in git. These are what the RUNNING app
-# writes, and egress.json holds naked_exit: this machine's address with the
-# tunnel DOWN.
-data/egress.json
-data/cases.json
-data/*.log

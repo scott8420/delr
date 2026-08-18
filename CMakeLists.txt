@@ -16,6 +16,11 @@ find_package(PkgConfig REQUIRED)
 # core stays headless-testable.
 add_library(delr_core STATIC
     src/core/Broker.cpp
+    # The CPPA registry becomes the roster. Pure -- text in, Roster out -- so
+    # the transformation that produces table one is itself checked, and so a
+    # user can rebuild the roster from the state's own CSV rather than trusting
+    # ours.
+    src/core/RosterImport.cpp
     # Table two: the caseload. PII, unlike the roster -- see the header.
     src/core/Case.cpp
     # The paste-a-URL path: parse, match, mint, commit. Everything between a
@@ -113,6 +118,9 @@ if(GTKMM_FOUND AND spdlog_FOUND)
     add_executable(delr
         src/main.cpp
         src/App.cpp
+        # Path resolution: assets beside the program, state under XDG. GTK-free
+        # and glib-free on purpose -- see include/Paths.hpp.
+        src/Paths.cpp
         # Follows the desktop's light/dark preference (GTK4 will not do it for
         # us and we do not link libadwaita). Needs no new dependency: the D-Bus
         # and GSettings calls are GIO, which gtkmm-4.0 already brings in.
@@ -140,6 +148,9 @@ if(GTKMM_FOUND AND spdlog_FOUND)
         # One real preflight from the command line, because the settings
         # surface that would otherwise run it is s7. Prints no addresses.
         src/netcheck.cpp
+        # The roster from the state's CSV, on demand. I/O only -- every
+        # judgement is in core/RosterImport where the checks can reach it.
+        src/importer.cpp
         # The core's checks ride in the app binary behind `--selftest` rather
         # than as a second executable. Compiled in, never run automatically.
         src/selftest.cpp

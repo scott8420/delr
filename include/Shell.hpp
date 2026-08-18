@@ -75,7 +75,12 @@ private:
     void on_case_selected();                  // category: handler: a row was picked
     void on_egress_settings();                // category: handler: open the tunnel settings
     void on_egress_saved(core::EgressPolicy p);  // category: handler: persist + repaint
-    void on_dump_registry();                  // category: handler: print the live widget tree
+    void on_dump_registry();
+    // Closing the one window ends the application. It also JOINS a check that
+    // is still in flight (see ~Shell), so quitting mid-fetch waits for the
+    // request to finish rather than tearing down memory the worker is writing
+    // into. That wait is bounded by the fetch timeout and is not a hang.
+    void on_quit();                  // category: handler: print the live widget tree
 
     // ── work ───────────────────────────────────────────────────────────────
     // One case, checked from a button. The threading is the shape EgressDialog
@@ -137,9 +142,18 @@ private:
     widgets::StackSidebar m_sidebar;
     widgets::Stack        m_stack;
 
-    // Roster page: a count label + a scrolling list, rebuilt on reload.
+    // Roster page: what the app IS, then the table it reads.
+    //
+    // The explainer is on THIS page rather than on Cases, and that is Scott's
+    // call from s12. The roster answers "who are these companies"; the
+    // question standing behind it is "and what is this program", and the two
+    // belong together. It is also the page the app opens on, so it is the
+    // first thing anyone reads.
     widgets::Box            m_roster_page;
+    widgets::Label          m_roster_lede;
+    widgets::Label          m_roster_how;
     widgets::Label          m_roster_status;
+    widgets::Separator      m_roster_rule;
     widgets::ScrolledWindow m_roster_scroll;
     widgets::ListBox        m_roster_list;
 

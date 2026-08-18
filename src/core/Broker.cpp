@@ -38,6 +38,10 @@ const Broker* roster_find(const Roster& r, const std::string& id) {
 std::vector<std::string> roster_validate(const Roster& r) {
     std::vector<std::string> problems;
     std::set<std::string> seen;
+    // Across entries, not within one: two brokers claiming the same host means
+    // broker_for_url picks by a tiebreak rather than by knowledge, and which
+    // one wins is an accident of roster order.
+    std::set<std::string> hosts;
 
     for (std::size_t i = 0; i < r.size(); ++i) {
         const auto& b = r[i];
@@ -59,6 +63,21 @@ std::vector<std::string> roster_validate(const Roster& r) {
 
         if (b.recheck_days <= 0)
             problems.push_back(where + ": recheck_days must be positive");
+
+        // A host that isn't a host matches nothing and fails silently -- the
+        // worst failure mode a lookup table has. Cheap to catch here; the
+        // importer is the thing most likely to produce one.
+        for (const auto& h : b.hosts) {
+            if (h.empty()) { problems.push_back(where + ": empty host"); continue; }
+            if (h.find('.') == std::string::npos ||
+                h.find('/') != std::string::npos ||
+                h.find(':') != std::string::npos ||
+                h.find(' ') != std::string::npos)
+                problems.push_back(where + ": host '" + h + "' is not a bare hostname");
+            if (!hosts.insert(h).second)
+                problems.push_back(where + ": host '" + h +
+                                   "' also belongs to another entry");
+        }
     }
     return problems;
 }
@@ -86,11 +105,16 @@ Roster roster_load(const std::string& file, std::string* error) {
         b.name          = e.value("name", "");
         b.site          = e.value("site", "");
         b.method        = method_from(e.value("method", "unknown"));
+        if (e.contains("hosts") && e["hosts"].is_array())
+            for (const auto& h : e["hosts"])
+                if (h.is_string()) b.hosts.push_back(h.get<std::string>());
         b.opt_out_url   = e.value("opt_out_url", "");
         b.opt_out_email = e.value("opt_out_email", "");
         b.requires_id   = e.value("requires_id", false);
         b.recheck_days  = e.value("recheck_days", 45);
-        b.ca_registered = e.value("ca_registered", false);
+        b.ca_registered  = e.value("ca_registered", false);
+        b.fcra_regulated = e.value("fcra_regulated", false);
+        b.collects_geo   = e.value("collects_geo", false);
         b.notes         = e.value("notes", "");
         out.push_back(std::move(b));
     }
@@ -104,12 +128,15 @@ bool roster_save(const std::string& file, const Roster& r) {
             {"id",            b.id},
             {"name",          b.name},
             {"site",          b.site},
+            {"hosts",         b.hosts},
             {"method",        method_name(b.method)},
             {"opt_out_url",   b.opt_out_url},
             {"opt_out_email", b.opt_out_email},
             {"requires_id",   b.requires_id},
             {"recheck_days",  b.recheck_days},
-            {"ca_registered", b.ca_registered},
+            {"ca_registered",  b.ca_registered},
+            {"fcra_regulated", b.fcra_regulated},
+            {"collects_geo",   b.collects_geo},
             {"notes",         b.notes},
         });
     }

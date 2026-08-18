@@ -11,6 +11,7 @@
 #include <gtkmm/listbox.h>
 #include <gtkmm/menubutton.h>
 #include <gtkmm/scrolledwindow.h>
+#include <gtkmm/separator.h>
 #include <gtkmm/stack.h>
 #include <gtkmm/stacksidebar.h>
 
@@ -27,6 +28,7 @@ using Label          = Named<Gtk::Label>;
 using ListBox        = Named<Gtk::ListBox>;
 using MenuButton     = Named<Gtk::MenuButton>;
 using ScrolledWindow = Named<Gtk::ScrolledWindow>;
+using Separator      = Named<Gtk::Separator>;
 using Stack          = Named<Gtk::Stack>;
 using StackSidebar   = Named<Gtk::StackSidebar>;
 

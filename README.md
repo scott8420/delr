@@ -43,6 +43,7 @@ forever. That's the job a computer should have.
 ./build/delr --selftest    # the core's checks, on demand
 ./build/delr --netcheck                                # preflight the saved policy
 ./build/delr --netcheck wg0 socks5h://127.0.0.1:1080   # or an ad-hoc one
+./build/delr --import-registry data/registry/cppa_registry2025.csv   # rebuild the roster
 ```
 
 `--netcheck` runs the whole preflight -- against the saved policy when given no
@@ -50,6 +51,12 @@ arguments, or a named interface when given one -- and reports what it found
 **without printing a single address** -- not the exit, not the tunnel's
 own, not the resolver. It is the thing to paste into a bug report when a check
 will not run.
+
+`--import-registry` rebuilds `data/brokers.json` from California's data broker
+registry export. **You do not have to trust the roster shipped here** -- download
+the state's CSV yourself and run the command; the transformation is in the tree,
+it is checked, and it merges rather than overwrites, so anything you have added
+or annotated survives.
 
 One binary. The core's checks ride in it behind `--selftest` rather than a
 second executable; they run when you ask for them, not as part of the build.
@@ -64,6 +71,7 @@ Stub. What exists and is exercised:
 | Piece | Where | State |
 |---|---|---|
 | Broker roster + JSON pump + validation | `include/core/Broker.hpp`, `src/core/Broker.cpp` | exercised |
+| Registry importer: CSV -> roster, merged not overwritten | `include/core/RosterImport.hpp`, `src/core/RosterImport.cpp` | exercised; **544 brokers, 553 listing domains** |
 | Caseload: status/outcome/provenance, dates, scheduling, exposure roll-up | `include/core/Case.hpp`, `src/core/Case.cpp` | exercised |
 | Promotion: when a listing is believed gone, and when it has come back | `include/core/Case.hpp`, `src/core/Case.cpp` | exercised |
 | Intake: URL parse, broker match by host, id minting, duplicate + relist detection | `include/core/Intake.hpp`, `src/core/Intake.cpp` | exercised |
@@ -79,7 +87,7 @@ Stub. What exists and is exercised:
 | The check, wired to a button: preflight, fetch, read the page, record it | `src/Shell_work.cpp` | compiles; **unverified visually** |
 | The maintenance queue -- listings fetched and not readable | `src/Shell_handlers.cpp` | compiles; **unverified visually** |
 | Follows the desktop light/dark preference | `include/Appearance.hpp`, `src/Appearance.cpp` | working |
-| Core checks (`delr --selftest`) | `src/selftest.cpp` | 676 pass / 0 fail, run on demand |
+| Core checks (`delr --selftest`) | `src/selftest.cpp` | 772 pass / 0 fail, run on demand |
 | One real preflight, printing no addresses (`delr --netcheck [wg0]`) | `src/netcheck.cpp` | works, against the saved policy or an ad-hoc one |
 | Tunnel settings: interface, lookups, proxy, trusted exits, baseline, preflight | `include/EgressDialog.hpp`, `src/EgressDialog.cpp` | compiles; **unverified visually** |
 | App shell, sidebar + stack, roster page | `src/Shell*.cpp` | compiles; **unverified visually** |
@@ -93,8 +101,17 @@ other, and only the case where both agree counts as working.
 ## Next
 
 Profile storage, encrypted at rest -- the source of the identifiers a listing is
-checked against · scheduled runs over the whole due queue, rate limited between
-brokers · roster fetched from a hosted repo with a baked-in fallback.
+checked against · opt-out filing by email, which the registry makes the primary
+channel · a journal that says loudly when nothing has run · scheduled runs over
+the whole due queue, rate limited between brokers.
+
+**The roster is 543 registrants; it is not 543 checkable listings.** California
+compels the list, so the roster is now complete and current on who holds data and
+where to write to them. Most of those companies are bulk data brokers with no
+page a person appears on -- there is nothing to fetch and nothing to verify. The
+verification half of this program reaches the people-search subset, and reaching
+even those needs page rules a human has to write by reading live pages. That work
+is still the gate, and it is the only part of this no session can do.
 
 **A check needs your own details before it can confirm a presence.** A rule with
 `needs_needle` asks that the listing's own identifiers appear on the page, which

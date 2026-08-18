@@ -236,6 +236,11 @@ const Broker* broker_for_url(const Roster& r, const std::string& url) {
     for (const auto& b : r) {
         consider(b, b.site);
         consider(b, b.opt_out_url);
+        // The rest of the registrant's estate. Without this line a paste from
+        // ownerly.com or usphonebook.com falls through to "unknown broker" and
+        // the user is asked to name a company whose registration the roster is
+        // already holding -- see the note on Broker::hosts.
+        for (const auto& h : b.hosts) consider(b, h);
     }
     return best;
 }

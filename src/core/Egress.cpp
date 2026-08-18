@@ -1,10 +1,23 @@
 #include "core/Egress.hpp"
 
+// For `url_check` only. The endpoints became settings in s9 and something has
+// to say whether what the user typed is a url -- and the answer to that
+// question already exists, once, in the module that guards a pasted listing.
+// Borrowing it beats a second parser here that would drift.
+#include "core/Intake.hpp"
+
+#include <nlohmann/json.hpp>
+
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
+
+using json = nlohmann::json;
 
 namespace delr::core {
 namespace {
@@ -217,10 +230,11 @@ bool addr_same(const std::string& a, const std::string& b) {
 
 const char* dns_mode_name(DnsMode m) {
     switch (m) {
-        case DnsMode::Unset:   return "unset";
-        case DnsMode::System:  return "system";
-        case DnsMode::Pinned:  return "pinned";
-        case DnsMode::Proxied: return "proxied";
+        case DnsMode::Unset:          return "unset";
+        case DnsMode::System:         return "system";
+        case DnsMode::SystemVerified: return "system-verified";
+        case DnsMode::Pinned:         return "pinned";
+        case DnsMode::Proxied:        return "proxied";
     }
     return "unset";
 }
@@ -228,6 +242,12 @@ const char* dns_mode_name(DnsMode m) {
 DnsMode dns_mode_from(const std::string& s) {
     const std::string v = lower(trim(s));
     if (v == "system")  return DnsMode::System;
+    // Spelled out, and NOT reached by any prefix or fuzzy match on "system".
+    // The whole point of two values is that a hand-edited `"dns": "system"`
+    // keeps meaning the refused thing; a loader generous enough to read it as
+    // the permissive one would be the sanitising loader this file's header
+    // spends a paragraph refusing to be.
+    if (v == "system-verified") return DnsMode::SystemVerified;
     if (v == "pinned")  return DnsMode::Pinned;
     if (v == "proxied") return DnsMode::Proxied;
     return DnsMode::Unset;   // including anything unrecognised: unknown means unset means refused
@@ -252,6 +272,9 @@ const char* verdict_name(Verdict v) {
         case Verdict::DnsUnset:         return "dns-unset";
         case Verdict::DnsSystem:        return "dns-system";
         case Verdict::ResolverMissing:  return "resolver-missing";
+        case Verdict::ProxyMissing:     return "proxy-missing";
+        case Verdict::ResolverBaselineMissing: return "resolver-baseline-missing";
+        case Verdict::CanaryDisabled:   return "canary-disabled";
         case Verdict::ExitUnpinned:     return "exit-unpinned";
         case Verdict::NoInterface:      return "no-interface";
         case Verdict::InterfaceDown:    return "interface-down";
@@ -290,6 +313,19 @@ const char* verdict_text(Verdict v) {
                    "nothing else leaks. Choose a resolver or proxy them.";
         case Verdict::ResolverMissing:
             return "A named resolver was chosen but no resolver address was given.";
+        case Verdict::ProxyMissing:
+            return "Lookups are set to go through a proxy, but no usable proxy "
+                   "address was given. It must be a socks5h address, so that "
+                   "names are looked up at the far end rather than here.";
+        case Verdict::ResolverBaselineMissing:
+            return "Lookups are set to use this computer's own resolver, which "
+                   "is only safe if delr can tell when one escapes the tunnel. "
+                   "It cannot yet: turn the tunnel OFF once and record how "
+                   "lookups are answered without it.";
+        case Verdict::CanaryDisabled:
+            return "There is no lookup-check service configured, so whether "
+                   "name lookups go through the tunnel cannot be tested at all. "
+                   "Nothing is allowed out until there is.";
         case Verdict::ExitUnpinned:
             return "Nothing is recorded to compare the tunnel against, so there "
                    "is no way to tell it apart from an ordinary connection. "
@@ -341,6 +377,53 @@ bool verdict_clear(Verdict v) { return v == Verdict::Pass; }
 
 // ── Policy validation ────────────────────────────────────────────────────────
 
+bool proxy_url_ok(const std::string& s) {
+    const std::string u = trim(s);
+    const std::string scheme = "socks5h://";
+    if (u.size() <= scheme.size()) return false;
+    // Case-insensitive on the scheme only; the authority is not ours to fold.
+    for (std::size_t i = 0; i < scheme.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(u[i])) != scheme[i]) return false;
+
+    const std::string authority = u.substr(scheme.size());
+    if (authority.empty()) return false;
+    // No path, query or fragment: a SOCKS proxy has none, and something that
+    // brought one along is a URL that was meant for somewhere else.
+    if (authority.find_first_of("/?#") != std::string::npos) return false;
+
+    // host[:port]. A bracketed v6 literal keeps its brackets.
+    std::string host = authority, port;
+    if (!authority.empty() && authority[0] == '[') {
+        const std::size_t close = authority.find(']');
+        if (close == std::string::npos) return false;
+        host = authority.substr(0, close + 1);
+        const std::string rest = authority.substr(close + 1);
+        if (!rest.empty()) {
+            if (rest[0] != ':') return false;
+            port = rest.substr(1);
+        }
+        if (addr_kind(authority.substr(1, close - 1)) == AddrKind::Invalid) return false;
+    } else {
+        const std::size_t colon = authority.rfind(':');
+        if (colon != std::string::npos) {
+            host = authority.substr(0, colon);
+            port = authority.substr(colon + 1);
+        }
+    }
+    if (host.empty()) return false;
+    for (char c : host)
+        if (std::isspace(static_cast<unsigned char>(c))) return false;
+
+    if (!port.empty()) {
+        if (port.size() > 5) return false;
+        for (char c : port)
+            if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+        const int n = std::atoi(port.c_str());
+        if (n <= 0 || n > 65535) return false;
+    }
+    return true;
+}
+
 std::vector<std::string> egress_policy_validate(const EgressPolicy& p) {
     std::vector<std::string> out;
 
@@ -352,14 +435,28 @@ std::vector<std::string> egress_policy_validate(const EgressPolicy& p) {
             out.push_back("egress: dns mode is unset");
             break;
         case DnsMode::System:
-            out.push_back("egress: dns mode 'system' leaks every hostname checked "
-                          "to the local network; not permitted");
+            out.push_back("egress: dns mode 'system' uses this computer's own "
+                          "resolver without checking it; not permitted -- "
+                          "'system-verified' is the checked form");
+            break;
+        case DnsMode::SystemVerified:
+            // The mode IS its evidence. Without the baseline the canary cannot
+            // recognise the leak it exists to catch, and the mode would be
+            // 'system' with a better name.
+            if (!naked_resolver_known(p))
+                out.push_back("egress: dns mode 'system-verified' with no recorded "
+                              "no-tunnel resolver -- the lookup check would have "
+                              "nothing to recognise a leak against");
             break;
         case DnsMode::Pinned:
             if (addr_canonical(p.resolver).empty())
                 out.push_back("egress: dns mode 'pinned' with no usable resolver address");
             break;
         case DnsMode::Proxied:
+            if (!proxy_url_ok(p.proxy))
+                out.push_back("egress: dns mode 'proxied' needs a socks5h:// proxy "
+                              "address (socks5:// without the 'h' resolves names "
+                              "here and leaks them)");
             break;
     }
 
@@ -389,10 +486,46 @@ std::vector<std::string> egress_policy_validate(const EgressPolicy& p) {
         out.push_back("egress: no accepted exit and no no-tunnel baseline -- a "
                       "preflight would have nothing to compare against");
 
+    // Same shape as the exit list above, on the other axis, and reported per
+    // entry rather than as a count: a list with one bad address in it needs one
+    // line removed, and "some of these are wrong" is not an instruction.
+    for (const auto& rz : p.naked_resolvers) {
+        if (addr_kind(rz) != AddrKind::Public)
+            out.push_back("egress: a recorded no-tunnel resolver is not a public "
+                          "address");
+    }
+
     if (p.preflight_ttl_s <= 0)
         out.push_back("egress: preflight lifetime must be positive");
 
+    // The endpoints. `url_check` is the codebase's one answer to "is this a URL
+    // we would touch", borrowed rather than re-derived -- a second URL opinion
+    // living in this file is exactly the drift the pump comment warns about.
+    if (trim(p.echo_url).empty()) {
+        out.push_back("egress: no address-check endpoint -- the preflight would "
+                      "have no way to see where the tunnel comes out");
+    } else if (url_check(p.echo_url) != UrlProblem::None) {
+        out.push_back(std::string("egress: the address-check endpoint is not a "
+                                  "usable url (") +
+                      url_problem_name(url_check(p.echo_url)) + ")");
+    }
+
+    if (trim(p.canary_url).empty()) {
+        out.push_back("egress: no lookup-check endpoint -- whether name lookups "
+                      "leave the tunnel cannot be tested, so nothing is allowed out");
+    } else if (url_check(p.canary_url) != UrlProblem::None) {
+        out.push_back(std::string("egress: the lookup-check endpoint is not a "
+                                  "usable url (") +
+                      url_problem_name(url_check(p.canary_url)) + ")");
+    }
+
     return out;
+}
+
+bool naked_resolver_known(const EgressPolicy& p) {
+    for (const auto& rz : p.naked_resolvers)
+        if (addr_kind(rz) == AddrKind::Public) return true;
+    return false;
 }
 
 // ── The decision ─────────────────────────────────────────────────────────────
@@ -405,6 +538,25 @@ Verdict egress_check(const EgressPolicy& p, const EgressObservation& o,
     if (p.dns == DnsMode::System)       return Verdict::DnsSystem;
     if (p.dns == DnsMode::Pinned && addr_canonical(p.resolver).empty())
         return Verdict::ResolverMissing;
+    if (p.dns == DnsMode::Proxied && !proxy_url_ok(p.proxy))
+        return Verdict::ProxyMissing;
+    // The load-bearing line of the whole mode. `SystemVerified` differs from
+    // `System` by exactly one thing -- that a leak would be RECOGNISED -- and
+    // recognising it requires knowing what the resolver looks like with the
+    // tunnel down. No baseline, no recognition, no mode.
+    if (p.dns == DnsMode::SystemVerified && !naked_resolver_known(p))
+        return Verdict::ResolverBaselineMissing;
+    // In every mode, not just that one: the canary has always been a hard gate
+    // and an unconfigured endpoint has always refused. What is new is that a
+    // person can now empty the box, so the refusal gets to say which box.
+    if (trim(p.canary_url).empty()) return Verdict::CanaryDisabled;
+    // The echo endpoint gets NO matching verdict here, and the asymmetry is on
+    // purpose. An empty echo lands as `ExitUnobserved`, which is a true and
+    // actionable sentence about the same fact -- and the echo is not the
+    // guarantee for any mode, because whatever it answers is checked against a
+    // baseline the user recorded. The canary under `SystemVerified` is the only
+    // guarantee there is, which is what earns it a name at the policy layer.
+    // The validator names both.
 
     int usable_exits = 0;
     for (const auto& e : p.accepted_exits)
@@ -481,6 +633,114 @@ Case apply_egress_refusal(const Case& c, const std::string& today, int retry_day
 std::string egress_log_ref(const EgressPolicy& p, Verdict v) {
     const std::string iface = trim(p.interface_name);
     return "egress:" + (iface.empty() ? std::string("-") : iface) + "/" + verdict_name(v);
+}
+
+// ── The pump ─────────────────────────────────────────────────────────────────
+
+EgressPolicy egress_policy_load(const std::string& file, std::string* error) {
+    EgressPolicy p;   // default-constructed: refuses everything
+    std::ifstream in(file);
+    if (!in) return p;   // first-run tolerant: absent is not an error
+
+    json j;
+    try {
+        in >> j;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return p;   // and a half-parsed policy is never returned
+    }
+    if (!j.contains("egress") || !j["egress"].is_object()) {
+        if (error) *error = "no 'egress' object";
+        return p;
+    }
+    const json& e = j["egress"];
+
+    p.interface_name = e.value("interface", "");
+    p.naked_exit     = e.value("naked_exit", "");
+    // Absent in every policy written before s11. Absent means "we do not know
+    // what it was recorded on", which is exactly true of a baseline recorded
+    // before anybody wrote this down, and reads as `TunnelCheck::Unchecked`
+    // rather than as a wrong answer.
+    p.naked_device   = e.value("naked_device", "");
+    // Verbatim, including "system" -- see the header. The refusal that names
+    // the real problem is worth more than a loader that tidies it away.
+    p.dns            = dns_mode_from(e.value("dns", "unset"));
+    p.resolver       = e.value("resolver", "");
+    p.proxy          = e.value("proxy", "");
+    p.preflight_ttl_s = e.value("preflight_ttl_s", static_cast<std::int64_t>(300));
+
+    // Defaulting to the value the STRUCT already holds, not to a literal
+    // repeated here. An absent key is a policy written before s9 and keeps the
+    // shipped endpoint; a key present and empty is a person who cleared the box
+    // and keeps meaning it. Those are different facts and a loader that folded
+    // them together would quietly re-enable a check the user turned off.
+    p.echo_url        = e.value("echo_url", p.echo_url);
+    p.canary_url      = e.value("canary_url", p.canary_url);
+
+    if (e.contains("accepted_exits") && e["accepted_exits"].is_array())
+        for (const auto& a : e["accepted_exits"])
+            if (a.is_string()) p.accepted_exits.push_back(a.get<std::string>());
+
+    if (e.contains("naked_resolvers") && e["naked_resolvers"].is_array())
+        for (const auto& a : e["naked_resolvers"])
+            if (a.is_string()) p.naked_resolvers.push_back(a.get<std::string>());
+
+    // Absent in every policy written before this session, which is correct: a
+    // one-device tunnel needs no siblings, and an empty list restores exactly
+    // the pre-s10 behaviour rather than loosening anything by default.
+    if (e.contains("tunnel_devs") && e["tunnel_devs"].is_array())
+        for (const auto& a : e["tunnel_devs"])
+            if (a.is_string()) p.tunnel_devs.push_back(a.get<std::string>());
+
+    return p;
+}
+
+bool egress_policy_save(const std::string& file, const EgressPolicy& p) {
+    json exits = json::array();
+    for (const auto& a : p.accepted_exits) exits.push_back(a);
+    json resolvers = json::array();
+    for (const auto& a : p.naked_resolvers) resolvers.push_back(a);
+    json devs = json::array();
+    for (const auto& a : p.tunnel_devs) devs.push_back(a);
+
+    json e;
+    e["interface"]       = p.interface_name;
+    e["tunnel_devs"]     = std::move(devs);
+    e["accepted_exits"]  = std::move(exits);
+    e["naked_exit"]      = p.naked_exit;
+    e["naked_device"]    = p.naked_device;
+    e["naked_resolvers"] = std::move(resolvers);
+    e["dns"]             = dns_mode_name(p.dns);
+    e["resolver"]        = p.resolver;
+    e["proxy"]           = p.proxy;
+    e["preflight_ttl_s"] = p.preflight_ttl_s;
+    e["echo_url"]        = p.echo_url;
+    e["canary_url"]      = p.canary_url;
+
+    json j;
+    j["version"] = 1;
+    j["egress"]  = std::move(e);
+
+    // Mode 0600 BEFORE the first byte of content, not after. Creating a
+    // world-readable file and then narrowing it leaves a window in which the
+    // user's home address is on disk and readable, and this is the one file in
+    // the tree where that window matters. Failing to set the mode is not fatal
+    // -- some filesystems have no opinion about permissions -- but it is not
+    // silently skipped either: an unwritable file still returns false below.
+    {
+        std::ofstream create(file, std::ios::app);
+        if (!create) return false;
+    }
+    std::error_code ec;
+    std::filesystem::permissions(
+        file,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, ec);
+
+    std::ofstream out(file, std::ios::trunc);
+    if (!out) return false;
+    out << j.dump(2) << "\n";
+    return out.good();
 }
 
 }  // namespace delr::core

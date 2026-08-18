@@ -35,10 +35,15 @@
 // ── What is in this file, and what is deliberately not ───────────────────────
 // The POLICY, and nothing else: what a tunnel has to look like, what a
 // preflight has to show, what counts as a refusal and what a refusal DOES to a
-// case. No sockets, no resolver, no clock, no filesystem. Everything here is a
+// case. No sockets, no resolver, no clock. Everything that JUDGES here is a
 // pure function of a policy the user configured and an observation somebody
 // else made, which means the whole of the leak-or-not decision is exercised in
 // `delr --selftest` with no packet in the room.
+//
+// The pump at the bottom is the one filesystem touch, and it is the same
+// exception `core/Broker` and `core/Case` already make: read bytes, write
+// bytes, decide nothing. No judgment function in this file opens a file and no
+// pump in this file reaches an opinion.
 //
 // The socket layer lands underneath this later and its only job is to fill in
 // an `EgressObservation` honestly. That inversion is the point: when the fetch
@@ -94,21 +99,42 @@ bool addr_same(const std::string& a, const std::string& b);
 // A mode, not a hostname setting, because the failure this prevents is not
 // "wrong resolver" but "the resolver you forgot about".
 enum class DnsMode {
-    Unset,    // nobody has decided. Refused: an undecided resolver is the system one.
-    System,   // whatever /etc/resolv.conf says. ALWAYS REFUSED -- see below.
-    Pinned,   // a named resolver, reached over the tunnel
-    Proxied   // the proxy resolves (socks5h, not socks5). The name never leaves here.
+    Unset,           // nobody has decided. Refused: an undecided resolver is the system one.
+    System,          // whatever /etc/resolv.conf says, unchecked. ALWAYS REFUSED -- see below.
+    SystemVerified,  // the same resolver, with the canary made load-bearing. See below.
+    Pinned,          // a named resolver, reached over the tunnel
+    Proxied          // the proxy resolves (socks5h, not socks5). The name never leaves here.
 };
 
 const char* dns_mode_name(DnsMode m);
 DnsMode     dns_mode_from(const std::string& s);
 
-// System is a refusal rather than a setting. This is the one place the module
-// takes an option away from the user on purpose: a tunnel with the host's own
-// resolver behind it leaks the entire roster and schedule to the ISP while
-// every HTTP request goes out clean, and it looks completely fine from inside
-// the app. There is no flag to allow it. A privacy tool with a switch that
-// silently defeats it does not have a switch, it has a bug with a label.
+// ── System and SystemVerified are two values because they are two claims ─────
+//
+// `System` is a refusal, and stays one. It means "use whatever this computer
+// uses and do not look": a tunnel with the host's own resolver behind it can
+// leak the entire roster and schedule to the ISP while every HTTP request goes
+// out clean, and from inside the app it looks completely fine. There is no flag
+// to allow it. A privacy tool with a switch that silently defeats it does not
+// have a switch, it has a bug with a label.
+//
+// `SystemVerified` is the same resolver with evidence attached, and it exists
+// because the blanket refusal was refusing the ORDINARY CASE. With a VPN
+// connected the system resolver IS the provider's, inside the tunnel; that is
+// not a leak, it is a correctly configured VPN. Refusing it made this app
+// unusable for anyone whose provider does not publish a SOCKS5 endpoint, which
+// is most people who own a VPN account.
+//
+// What makes the difference real rather than cosmetic is that under this mode
+// THE CANARY IS THE GUARANTEE. `Proxied` is guaranteed by the proxy and merely
+// corroborated by the canary; here there is nothing else, so the mode requires
+// a recorded `naked_resolver` and refuses without one
+// (`ResolverBaselineMissing`), and every canary state except `Clean` is a hard
+// refusal. It is the weaker mode and the window says so in words.
+//
+// The two values also keep the file honest about its own history: a
+// hand-edited `"dns": "system"` must not silently upgrade itself into the
+// permissive mode. It loads as `System`, and it is refused by name.
 
 // ── Did the name lookup go where it was supposed to? ─────────────────────────
 // The preflight's canary: resolve something whose answer we can attribute, and
@@ -130,6 +156,32 @@ const char* canary_name(Canary c);
 struct EgressPolicy {
     std::string interface_name;   // "wg0", "tun0" -- what we bind to
 
+    // The OTHER devices that are also this tunnel.
+    //
+    // s6 assumed a tunnel is one interface, every hermetic check agreed, and
+    // one real VPN broke it the first time anybody pointed the app at one:
+    // Surfshark's WireGuard carries v4 on `surfshark_wg` and v6 on
+    // `surfshark_ipv6`. The v6 default route goes via a device whose name is
+    // not `interface_name`, `v6_default_route` reads that as a route around the
+    // tunnel, and a correctly-tunnelled machine is refused with V6OffTunnel.
+    //
+    // ── Why this is a separate field and not just a wider `interface_name` ───
+    // BINDING AND ROUTE-CHECKING ARE DIFFERENT QUESTIONS, and they only shared
+    // a field while one name happened to answer both. "Where do I send this"
+    // has exactly one answer -- CURLOPT_INTERFACE takes one device and there is
+    // no meaning to binding a socket to two. "Is my v6 default inside my
+    // tunnel" legitimately has several, because a provider may split a tunnel
+    // across devices and that is not a leak.
+    //
+    // So `interface_name` stays singular and load-bearing for the bind, and
+    // this list widens ONLY the route question. Nothing here is ever bound to,
+    // and a name in this list grants no capability -- the worst a wrong entry
+    // can do is stop V6OffTunnel firing on a route that really is outside the
+    // tunnel, which is why it is a list the user types rather than anything
+    // inferred from a prefix. `surfshark_*` was the cheap fix and it is a guess
+    // wearing a rule: a device named to match walks straight through it.
+    std::vector<std::string> tunnel_devs;
+
     // Exit addresses we accept. A LIST, not one address: providers rotate exit
     // nodes, and a policy pinned to a single address would refuse the whole app
     // the first time the provider did something normal. The UI's job is to
@@ -143,8 +195,75 @@ struct EgressPolicy {
     // Never logged, never displayed, never sent anywhere.
     std::string naked_exit;
 
+    // WHICH DEVICE the baseline above was recorded on. Not a setting -- a
+    // record of an act, written only when a Record succeeds and cleared when
+    // the baseline it belongs to is forgotten.
+    //
+    // It buys two things, both of them setup-path rather than check-path. It
+    // survives a restart, so the box a user had to guess at on first run comes
+    // back filled on every run after. And it is the ONLY thing the app can
+    // compare a detected tunnel device against: if the device carrying traffic
+    // with the VPN on is the device the baseline was recorded on with the VPN
+    // off, the VPN is not up, and writing that name into `interface_name` would
+    // configure the app to bind to the user's ordinary connection and call it a
+    // tunnel. See `core::tunnel_check`.
+    //
+    // NOT PII, unlike its two neighbours. An interface name is not an address
+    // and is shown in this window already -- `iface_list()` prints the whole
+    // set of them. It rides in the same 0600 file because it belongs to the
+    // same act, not because it needs the protection.
+    //
+    // Nothing in `egress_check` reads it. A wrong value here cannot let a
+    // request out; the worst it does is decline to warn about a tunnel that is
+    // not up, which is the state the app was in before this field existed.
+    std::string naked_device;
+
+    // The other half of the same baseline: WHO ANSWERS THE LOOKUP with the
+    // tunnel down. Recorded in the same deliberate act as `naked_exit`, on the
+    // same naked request, and used for exactly one thing -- to fail the canary
+    // when one of them answers with the tunnel up.
+    //
+    // Without this, the canary could only catch a lookup that THIS MACHINE
+    // answered, which is the narrow case. The ordinary leak escapes to the
+    // ISP's resolver, whose address is nothing like the user's own and reads
+    // as a perfectly good public answer. Under `Proxied` that weakness was
+    // tolerable because the proxy was the guarantee; under `SystemVerified`
+    // the canary IS the guarantee, and a mode that looks verified and verifies
+    // nothing is worse than the refusal it replaced.
+    //
+    // ── A LIST, and for a different reason than `accepted_exits` ─────────────
+    // The exit list is plural because providers rotate exits and a policy
+    // pinned to one would refuse a working tunnel. This one is plural because
+    // ONE SAMPLE IS NOT THE SET: a provider's recursive resolvers routinely
+    // answer from a pool, so a baseline that captured R1 would wave a leak
+    // through R2 while looking perfectly verified. The two lists therefore fail
+    // in opposite directions -- a missing exit costs a false refusal, a missing
+    // resolver costs a missed leak -- which is why recording APPENDS here
+    // instead of replacing, and why pressing Record more than once with the
+    // tunnel off is a documented thing to do rather than a mistake.
+    //
+    // It is still not a proof. A pool nobody sampled is a pool nobody knows
+    // about, and the honest claim for this mode is "every resolver we have ever
+    // seen answer you without a tunnel", never "any resolver that is not your
+    // provider's".
+    //
+    // PII, exactly like `naked_exit`: recorded, never displayed, never logged.
+    // Only the COUNT is ever said out loud.
+    std::vector<std::string> naked_resolvers;
+
     DnsMode     dns = DnsMode::Unset;
     std::string resolver;   // required when dns == Pinned
+
+    // The SOCKS proxy, required when dns == Proxied: "socks5h://host:port".
+    //
+    // The 'h' is not a spelling preference and `proxy_url_ok` refuses without
+    // it. `socks5://` resolves the name HERE and sends the address onward;
+    // `socks5h://` sends the name and the far end resolves it. Same wire
+    // protocol, same working app, and one of them leaks the entire check
+    // roster to whoever answers this machine's lookups while every byte of
+    // HTTP goes out clean through the proxy. That is DnsMode::System wearing a
+    // proxy's clothes, and it is refused for the same reason.
+    std::string proxy;
 
     // How long a preflight pass is good for. A preflight is a fact about a
     // moment: tunnels drop between requests, and a pass from an hour ago is a
@@ -152,13 +271,55 @@ struct EgressPolicy {
     // round trip and the cost of trusting a stale one is the whole point of the
     // app.
     std::int64_t preflight_ttl_s = 300;
+
+    // ── Where the preflight asks its two questions ───────────────────────────
+    // These were literals in `net::ObserverConfig` for three sessions and the
+    // deferral expired the moment `SystemVerified` landed. Under `Proxied` a
+    // dead canary endpoint is an annoyance -- the proxy is still the guarantee.
+    // Under `SystemVerified` the canary is the ONLY guarantee, so a third party
+    // going away, changing its output, or starting to return an ad becomes
+    // every check refusing, with no way to fix it short of a rebuild.
+    //
+    // They live in the POLICY rather than in the net layer because they are
+    // user configuration that has to persist and has to be editable, and
+    // because putting the defaults here gives them one home instead of two that
+    // can drift. `net::ObserverConfig` defaults to empty and is built from
+    // these; an observer handed nothing observes nothing, which is the failure
+    // direction this codebase already fails in.
+    //
+    // Neither endpoint is TRUSTED with anything. The echo's answer is compared
+    // against a baseline the user recorded, and the canary's is only ever used
+    // to FAIL. A hostile endpoint can refuse checks; it cannot permit one.
+    //
+    // An empty `canary_url` disables the canary, which is `CanaryNotRun`, which
+    // is a refusal -- and under `SystemVerified` that is the whole mode gone.
+    // "We did not check whether the lookup leaked" must never read as "it
+    // didn't".
+    std::string echo_url   = "https://api.ipify.org";
+    std::string canary_url = "https://edns.ip-api.com/json";
 };
+
+// Is this a proxy we can use without leaking the lookup? "socks5h://host:port",
+// and nothing else -- see EgressPolicy::proxy for why the 'h' is load-bearing.
+// A bare host, an http proxy, or a socks5 without the 'h' are all false.
+bool proxy_url_ok(const std::string& s);
 
 // Guards the policy itself, in the house style: a problem per line, empty means
 // clean. Same job as `roster_validate` -- a policy that cannot be satisfied is
 // a bug in the CONFIG, and finding it at configure time beats finding it as a
 // refusal on every fetch forever.
 std::vector<std::string> egress_policy_validate(const EgressPolicy& p);
+
+// Is there at least one usable no-tunnel resolver recorded? The precondition
+// `SystemVerified` stands on, defined ONCE because four callers ask it -- the
+// validator, `egress_check`, `--netcheck` and the settings window -- and four
+// hand-rolled loops are four chances for the window to say "recorded" about a
+// policy the check refuses.
+//
+// A recorded address that is not public does not count. A resolver on the local
+// network is this computer's own resolver by another name, and a baseline made
+// of one would fail every lookup rather than the leaked ones.
+bool naked_resolver_known(const EgressPolicy& p);
 
 // ── The observation ──────────────────────────────────────────────────────────
 // What the layer below measured. Today the selftest fills this in; tomorrow the
@@ -209,6 +370,24 @@ enum class Verdict {
     DnsUnset,         // nobody decided how names resolve
     DnsSystem,        // the host resolver. Refused by design; see DnsMode.
     ResolverMissing,  // Pinned, with no usable resolver address
+    ProxyMissing,     // Proxied, with no usable socks5h proxy. Same shape as
+                      // the line above: the mode names where lookups go and
+                      // the address of that somewhere is missing.
+    ResolverBaselineMissing,  // SystemVerified with no recorded `naked_resolver`.
+                      // Same shape again, one layer over: this mode names no
+                      // resolver at all, so the only thing standing between it
+                      // and `System` is the canary, and the canary cannot
+                      // recognise a leak without knowing what the leak looks
+                      // like. The mode is its evidence; absent the evidence
+                      // there is no mode.
+    CanaryDisabled,   // no canary endpoint configured, in any mode. The lookup
+                      // check was switched OFF rather than failed, which is a
+                      // policy problem and not a network one -- no amount of
+                      // re-running finds an endpoint nobody named. It has
+                      // always produced a refusal (as `CanaryNotRun`); it only
+                      // became reachable-on-purpose when the endpoints became
+                      // a setting, and "you cleared this box" and "the
+                      // preflight never ran" are two different sentences.
     ExitUnpinned,     // no accepted exit AND no naked baseline: the preflight
                       // has nothing to compare against, so it cannot answer its
                       // one question and passing it would be theatre.
@@ -300,5 +479,41 @@ Case apply_egress_refusal(const Case& c, const std::string& today,
 // naked address, no resolver: an ip in a log file is the user's location in a
 // log file. Anything that logs an egress decision logs THIS.
 std::string egress_log_ref(const EgressPolicy& p, Verdict v);
+
+// ── Persistence pump ─────────────────────────────────────────────────────────
+// Encode and decode in ONE place so a write cannot skew from its read, exactly
+// as `roster_load`/`roster_save` and `caseload_load`/`caseload_save`. The
+// CALLER resolves the path: the UI does the XDG work and hands in a plain
+// string, so this file still never learns what a desktop is.
+//
+// ── FIDELITY IS THE BAR, AND IT INCLUDES THE BAD VALUES ──────────────────────
+// A hand-edited file saying `"dns": "system"` loads as `DnsMode::System` and is
+// then refused, loudly and by name, by `egress_policy_validate` and
+// `egress_check`. It does NOT quietly become `Unset`. Both refuse, so the app
+// is equally safe either way -- but they refuse with different sentences, and
+// "the host resolver leaks every hostname you check" is the sentence that
+// tells the truth about what is in the file. A loader that sanitises its input
+// hands the user a fixed problem and the wrong explanation.
+//
+// Unrecognised values still fall to `Unset` via `dns_mode_from`, because there
+// is no honest sentence to say about a mode nobody has ever heard of.
+//
+// ── PII WARNING, AND IT IS THE WHOLE FILE ────────────────────────────────────
+// This writes `naked_exit` -- the user's home address, the one identifier this
+// entire app exists to keep away from brokers -- to disk in the clear. That is
+// not comfortable and it is not hidden: the policy cannot decide `ExitNaked`
+// without it, and a baseline the user has to re-record on every launch is a
+// baseline nobody records. `egress_policy_save` therefore creates the file
+// mode 0600 BEFORE it writes a byte, rather than chmod-ing a world-readable
+// file afterwards, because the gap between those two is a real gap. Encryption
+// at rest is s9-s10's problem for the profile and this file rides along with
+// it when it lands; until then 0600 and a comment is what is true.
+//
+// load is first-run tolerant: a missing file yields a DEFAULT-CONSTRUCTED
+// policy, which is the policy that refuses everything. "We have not been
+// configured" and "we are configured to allow nothing" are the same state here
+// on purpose, and it is the safe one.
+EgressPolicy egress_policy_load(const std::string& file, std::string* error = nullptr);
+bool         egress_policy_save(const std::string& file, const EgressPolicy& p);
 
 }  // namespace delr::core

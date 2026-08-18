@@ -41,7 +41,15 @@ forever. That's the job a computer should have.
 ./build.sh         # configure + build
 ./run.sh           # build, then start the app
 ./build/delr --selftest    # the core's checks, on demand
+./build/delr --netcheck                                # preflight the saved policy
+./build/delr --netcheck wg0 socks5h://127.0.0.1:1080   # or an ad-hoc one
 ```
+
+`--netcheck` runs the whole preflight -- against the saved policy when given no
+arguments, or a named interface when given one -- and reports what it found
+**without printing a single address** -- not the exit, not the tunnel's
+own, not the resolver. It is the thing to paste into a bug report when a check
+will not run.
 
 One binary. The core's checks ride in it behind `--selftest` rather than a
 second executable; they run when you ask for them, not as part of the build.
@@ -59,11 +67,23 @@ Stub. What exists and is exercised:
 | Caseload: status/outcome/provenance, dates, scheduling, exposure roll-up | `include/core/Case.hpp`, `src/core/Case.cpp` | exercised |
 | Promotion: when a listing is believed gone, and when it has come back | `include/core/Case.hpp`, `src/core/Case.cpp` | exercised |
 | Intake: URL parse, broker match by host, id minting, duplicate + relist detection | `include/core/Intake.hpp`, `src/core/Intake.cpp` | exercised |
-| Egress policy: bind, preflight identity, DNS mode, one named verdict | `include/core/Egress.hpp`, `src/core/Egress.cpp` | exercised; no socket under it yet |
+| Egress policy: bind, preflight identity, DNS mode, one named verdict | `include/core/Egress.hpp`, `src/core/Egress.cpp` | exercised |
+| A DNS mode an ordinary VPN account can meet, with the leak test as its guarantee | `include/core/Egress.hpp`, `src/core/Probe.cpp` | exercised |
+| Page rules: what a fetched page has to say for a listing to count as gone | `include/core/PageRules.hpp`, `src/core/PageRules.cpp` | exercised |
+| The observer's judgment: readings -> observation | `include/core/Probe.hpp`, `src/core/Probe.cpp` | exercised |
+| The verification fetch, over libcurl, gated by the policy | `include/net/Fetch.hpp`, `src/net/Fetch.cpp` | exercised; fetches real pages |
+| The syscall shim: getifaddrs, bind, routes, echo, canary | `include/net/Observer.hpp`, `src/net/Observer.cpp` | exercised; runs a real preflight |
+| Egress policy on disk, 0600 because it holds your own address | `src/core/Egress.cpp` | exercised; round-trips |
+| Recording your no-tunnel baseline -- your own address AND who answers your lookups | `src/net/Observer.cpp` | exercised (its refusals); one real request |
+| Page rules loaded and validated against the roster | `src/Shell_handlers.cpp` | exercised |
+| The check, wired to a button: preflight, fetch, read the page, record it | `src/Shell_work.cpp` | compiles; **unverified visually** |
+| The maintenance queue -- listings fetched and not readable | `src/Shell_handlers.cpp` | compiles; **unverified visually** |
 | Follows the desktop light/dark preference | `include/Appearance.hpp`, `src/Appearance.cpp` | working |
-| Core checks (`delr --selftest`) | `src/selftest.cpp` | 418 pass / 0 fail, run on demand |
+| Core checks (`delr --selftest`) | `src/selftest.cpp` | 676 pass / 0 fail, run on demand |
+| One real preflight, printing no addresses (`delr --netcheck [wg0]`) | `src/netcheck.cpp` | works, against the saved policy or an ad-hoc one |
+| Tunnel settings: interface, lookups, proxy, trusted exits, baseline, preflight | `include/EgressDialog.hpp`, `src/EgressDialog.cpp` | compiles; **unverified visually** |
 | App shell, sidebar + stack, roster page | `src/Shell*.cpp` | compiles; **unverified visually** |
-| Cases page: status line, exposure roll-up, case list | `src/Shell_zones.cpp`, `src/Shell_handlers.cpp` | compiles; **unverified visually** |
+| Cases page: status line, exposure roll-up, maintenance line, case list | `src/Shell_zones.cpp`, `src/Shell_handlers.cpp` | compiles; **unverified visually** |
 | Add a case: paste a URL, pick the broker, tick what it exposes | `include/AddCaseDialog.hpp`, `src/AddCaseDialog.cpp` | compiles; **unverified visually** |
 
 The GUI has been compiled but never *seen* — there's no display in the
@@ -72,9 +92,26 @@ other, and only the case where both agree counts as working.
 
 ## Next
 
-The socket layer under `core/Egress` (bind to the tunnel, run the preflight,
-fill in an observation) · the verification fetch itself · roster fetched from a
-hosted repo with a baked-in fallback · profile storage, encrypted at rest.
+Profile storage, encrypted at rest -- the source of the identifiers a listing is
+checked against · scheduled runs over the whole due queue, rate limited between
+brokers · roster fetched from a hosted repo with a baked-in fallback.
+
+**A check needs your own details before it can confirm a presence.** A rule with
+`needs_needle` asks that the listing's own identifiers appear on the page, which
+is what turns "this looks like a profile page" into "this is YOUR profile page".
+Until profile storage lands, those brokers answer `NoNeedles` -- indeterminate,
+never a removal, and shown in the maintenance line rather than counted as clean.
+
+**Name lookups need a SOCKS5 proxy.** The stock Debian/Ubuntu libcurl is built
+with the threaded resolver rather than c-ares, so `CURLOPT_DNS_SERVERS` returns
+`CURLE_NOT_BUILT_IN` and a pinned resolver silently would not take effect. A
+pinned resolver that did not pin is the host resolver, which is refused by
+design -- so this app refuses it too, loudly, rather than fetching anyway. That
+leaves `socks5h://`, where the proxy resolves and the name never leaves this
+machine at all. Most commercial VPNs publish a SOCKS5 endpoint; an `ssh -D` also
+works. `delr --netcheck` reports whether your libcurl can pin, and the settings window
+says so plainly rather than letting you choose something that would not take
+effect.
 
 The check goes out through a tunnel or it does not go out. `core/Egress` decides
 that as a pure function of a configured policy and an observation somebody else

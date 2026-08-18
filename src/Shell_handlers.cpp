@@ -2,12 +2,15 @@
 #include "Shell.hpp"
 #include "Registry.hpp"
 #include "Log.hpp"
+#include "netcheck.hpp"
 
 #include <glibmm/miscutils.h>
 #include <glibmm/datetime.h>
 #include <gtkmm/label.h>
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <vector>
 
 namespace delr {
 
@@ -63,6 +66,37 @@ std::string Shell::cases_file() const {
     return Glib::build_filename(Glib::get_current_dir(), "data", "cases.json");
 }
 
+// Table three's path. Same shape as the two above; its own env override
+// because it is its own file, and it is its own file because it rots on a
+// designer's schedule rather than a company's.
+std::string Shell::rules_file() const {
+    if (const char* env = std::getenv("DELR_RULES")) return env;
+    return Glib::build_filename(Glib::get_current_dir(), "data", "pagerules.json");
+}
+
+void Shell::on_reload_rules() {
+    const std::string file = rules_file();
+    std::string err;
+    m_rules = core::rules_load(file, &err);
+
+    auto lg = log::get(log::Area::Cases);
+    if (lg) {
+        if (!err.empty()) lg->error("page rules parse failed: {}", err);
+        else              lg->info("page rules loaded: {} rule(s)", m_rules.size());
+    }
+
+    // Validated AGAINST THE ROSTER, which is the whole reason this reload runs
+    // after that one: a rule naming a broker nobody has is a rule that will
+    // never fire, and it is the same class of bug as a dead mapping entry.
+    const auto problems = core::rules_validate(m_rules, &m_roster);
+    for (const auto& p : problems) if (lg) lg->warn("rules: {}", p);
+
+    // No status line of its own. A rule is not a thing the user does anything
+    // with; what they need to know is which of THEIR cases cannot be read, and
+    // that sentence is the maintenance line on the cases page.
+    if (!m_caseload.empty()) on_reload_cases();
+}
+
 // The clock lives on the UI side. core::Case does date ARITHMETIC and never
 // asks what day it is -- a "pure" function that reads the clock isn't pure, and
 // "which cases are due" would stop being testable the moment the core could
@@ -102,6 +136,11 @@ std::string Shell::case_row_text(const core::Case& k) const {
     }
     if (k.consecutive_failures > 0)
         line += "  [" + std::to_string(k.consecutive_failures) + " failed]";
+    // The evidence toward believing it gone, shown next to the evidence
+    // against. One clean absence is an event and two is a pattern, and a row
+    // that shows only "not found" hides which of those this is.
+    if (k.clean_absences > 0)
+        line += "  [" + std::to_string(k.clean_absences) + " clean]";
     if (!k.next_check.empty()) line += "   due " + k.next_check;
     line += "   " + host;
     return line;
@@ -127,6 +166,16 @@ void Shell::on_reload_cases() {
         if (lg) lg->debug("{} status={} outcome={}", core::log_ref(k),
                           core::status_name(k.status), core::outcome_name(k.outcome));
 
+    // Which case was selected, by ID rather than by row index: a repaint after
+    // a relist has one more row than it started with, and an index would then
+    // move the user's selection onto a different listing without telling them.
+    std::string was_selected;
+    if (auto* sel = m_cases_list.get_selected_row()) {
+        const int i = sel->get_index();
+        if (i >= 0 && static_cast<std::size_t>(i) < m_caseload.size())
+            was_selected = m_caseload[static_cast<std::size_t>(i)].id;
+    }
+
     while (auto* row = m_cases_list.get_row_at_index(0)) m_cases_list.remove(*row);
     for (const auto& k : m_caseload) {
         auto* row = Gtk::make_managed<Gtk::Label>(case_row_text(k));
@@ -135,9 +184,20 @@ void Shell::on_reload_cases() {
         m_cases_list.append(*row);
     }
 
+    if (!was_selected.empty()) {
+        for (std::size_t i = 0; i < m_caseload.size(); ++i) {
+            if (m_caseload[i].id != was_selected) continue;
+            if (auto* row = m_cases_list.get_row_at_index(static_cast<int>(i)))
+                m_cases_list.select_row(*row);
+            break;
+        }
+    }
+    refresh_check_button();
+
     if (!err.empty()) {
         m_cases_status.set_text("Caseload failed to parse: " + err);
         m_cases_exposure.set_text("");
+        m_cases_maintenance.set_text("");
         return;
     }
 
@@ -146,6 +206,7 @@ void Shell::on_reload_cases() {
         // an empty caseload is the correct first-run condition and not an error
         // to apologise for.
         m_cases_status.set_text("No cases yet.");
+        m_cases_maintenance.set_text("");
         m_cases_exposure.set_text(
             "Find your own listing in your own browser, then add its URL with + "
             "in the title bar (Ctrl+N). delr does not search brokers for you -- "
@@ -185,7 +246,40 @@ void Shell::on_reload_cases() {
         }
         m_cases_exposure.set_text(line);
     }
+
+    // ── The maintenance queue ────────────────────────────────────────────────
+    // `caseload_unverifiable()` is the core's own answer to "which of these did
+    // we fetch and fail to READ" -- a missing rule, a rotted one, a page that
+    // did not fingerprint. Asked rather than recomputed here, because it is
+    // the honest denominator behind any count this window prints, and two
+    // definitions of "unverifiable" would be one too many.
+    //
+    // Named by BROKER, not by case: the fix is a rule, and a rule is per
+    // broker. A list of case ids would tell the user nothing they can act on.
+    const auto stuck = core::caseload_unverifiable(m_caseload);
+    if (stuck.empty()) {
+        m_cases_maintenance.set_text("");
+    } else {
+        std::vector<std::string> who;
+        for (const core::Case* k : stuck) {
+            const auto* b = core::roster_find(m_roster, k->broker_id);
+            const std::string name = b ? b->name : k->broker_id;
+            if (std::find(who.begin(), who.end(), name) == who.end())
+                who.push_back(name);
+        }
+        std::string line = std::to_string(stuck.size()) +
+                           " listing(s) could be fetched but not read -- ";
+        for (std::size_t i = 0; i < who.size(); ++i) line += (i ? ", " : "") + who[i];
+        line +=
+            ". That is a page rule missing or out of date, not an answer about "
+            "the listing: those checks count as unverified and never as gone.";
+        m_cases_maintenance.set_text(line);
+    }
 }
+
+// A row was picked, or unpicked. The only thing that hangs off it is whether
+// there is something for the check button to act on.
+void Shell::on_case_selected() { refresh_check_button(); }
 
 // ── Intake ───────────────────────────────────────────────────────────────────
 
@@ -235,6 +329,118 @@ void Shell::on_case_committed(core::Case fresh) {
     // instead of by assumption.
     on_reload_cases();
     m_stack.set_visible_child(m_cases_page);
+}
+
+// ── The tunnel policy ────────────────────────────────────────────────────────
+
+// Same shape as the two above, third table. Unlike the roster and like the
+// caseload this file is PII -- it holds `naked_exit` -- and the pump writes it
+// 0600 for that reason. Path resolution stays here because path resolution is
+// the UI's job, which is the same seam that keeps the clock out of the core.
+std::string Shell::egress_file() const {
+    // Deferred to `netcheck::policy_path()` rather than repeated here, so
+    // `delr --netcheck` with no arguments reads the same file this window
+    // writes. Two definitions of a default path is two programs.
+    const std::string p = netcheck::policy_path();
+    if (Glib::path_is_absolute(p)) return p;
+    return Glib::build_filename(Glib::get_current_dir(), p);
+}
+
+void Shell::on_reload_egress() {
+    std::string err;
+    m_egress = core::egress_policy_load(egress_file(), &err);
+
+    const auto problems = core::egress_policy_validate(m_egress);
+    // The validator's answer, cached for the check button. Whether a check may
+    // be OFFERED is the same question as whether the policy is coherent, and
+    // that question already has an owner.
+    m_egress_ok = err.empty() && problems.empty();
+
+    // The pristine state: nothing has ever been configured. Distinguished from
+    // "configured, and wrong" because they are different events and want
+    // different levels -- a first launch is not a warning, and a policy that
+    // used to work and no longer validates is.
+    const bool untouched = m_egress.interface_name.empty() &&
+                           m_egress.dns == core::DnsMode::Unset &&
+                           m_egress.accepted_exits.empty() &&
+                           m_egress.naked_exit.empty() &&
+                           // s9's other half of the baseline. A user who
+                           // recorded their lookups and nothing else has
+                           // configured something, and logging that as a first
+                           // launch would file a real state under "pristine".
+                           m_egress.naked_resolvers.empty();
+
+    auto lg = log::get(log::Area::App);
+    if (lg) {
+        if (!err.empty()) {
+            lg->error("egress policy parse failed: {}", err);
+        } else if (untouched) {
+            lg->info("egress policy: none saved yet, so nothing will be checked");
+        } else {
+            // NOT `egress_log_ref` with a verdict here. That function pairs an
+            // interface with a JUDGMENT, and nothing has been judged at load
+            // time -- passing `Pass` to fill the slot printed "egress:-/pass"
+            // over a policy that refuses everything, which is the one thing a
+            // log in this program must never do. The interface name and the
+            // mode are both safe to say; neither is an address.
+            lg->info("egress policy loaded: interface={} lookups={} problems={}",
+                     m_egress.interface_name.empty() ? "-" : m_egress.interface_name,
+                     core::dns_mode_name(m_egress.dns), problems.size());
+        }
+    }
+
+    // The validator already says "egress: " at the front of every line. The
+    // area tag is on the left of the log line as well, so a second prefix here
+    // made it "egress: egress: ...".
+    if (lg && !untouched)
+        for (const auto& p : problems) lg->warn("{}", p);
+
+    refresh_check_button();
+
+    if (!err.empty()) {
+        m_egress_status.set_text("Tunnel settings failed to parse — see the log.");
+    } else if (problems.empty()) {
+        m_egress_status.set_text(
+            "Tunnel: configured. Checks will run a preflight first and refuse "
+            "if it does not pass.");
+    } else if (untouched) {
+        // The honest first-run state, and not an error to apologise for: a
+        // policy nobody has written is a policy that allows nothing, which is
+        // the safe reading of "I don't know".
+        m_egress_status.set_text(
+            "Tunnel: not set up yet, so nothing will be checked. Open “Tunnel "
+            "and privacy” in the menu — checks go out through a tunnel or they "
+            "do not go out at all.");
+    } else {
+        m_egress_status.set_text(
+            "Tunnel: " + std::to_string(problems.size()) +
+            " thing(s) still to sort out before anything can be checked. See "
+            "“Tunnel and privacy” in the menu.");
+    }
+}
+
+void Shell::on_egress_settings() { m_egress_dialog.open(*this, m_egress); }
+
+void Shell::on_egress_saved(core::EgressPolicy p) {
+    m_egress = std::move(p);
+
+    const std::string file = egress_file();
+    std::error_code ec;
+    std::filesystem::create_directories(Glib::path_get_dirname(file), ec);
+
+    auto lg = log::get(log::Area::App);
+    if (!core::egress_policy_save(file, m_egress)) {
+        if (lg) lg->error("egress policy save failed");
+        m_egress_status.set_text(
+            "Tunnel settings could not be saved — see the log.");
+        return;
+    }
+    if (lg) lg->info("egress policy saved");
+
+    // Repaint FROM DISK, exactly as the caseload does: the reload proves the
+    // write round-tripped, so the trace and the window agree by construction
+    // rather than by assumption.
+    on_reload_egress();
 }
 
 void Shell::on_dump_registry() { registry::dump(); }

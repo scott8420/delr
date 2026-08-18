@@ -83,6 +83,8 @@ const char* reason_name(Reason r) {
         case Reason::Timeout:     return "timeout";
         case Reason::BadResponse: return "bad-response";
         case Reason::UrlDead:     return "url-dead";
+        case Reason::NoRule:         return "no-rule";
+        case Reason::PageUnreadable: return "page-unreadable";
     }
     return "none";
 }
@@ -95,6 +97,8 @@ Reason reason_from(const std::string& s) {
     if (s == "timeout")      return Reason::Timeout;
     if (s == "bad-response") return Reason::BadResponse;
     if (s == "url-dead")     return Reason::UrlDead;
+    if (s == "no-rule")         return Reason::NoRule;
+    if (s == "page-unreadable") return Reason::PageUnreadable;
     return Reason::None;
 }
 

@@ -10,8 +10,15 @@
 #include "core/Case.hpp"
 #include "core/Egress.hpp"
 #include "core/Intake.hpp"
+#include "core/PageRules.hpp"
+#include "core/Probe.hpp"
+#include "net/Fetch.hpp"
+#include "net/Observer.hpp"
 
 #include <cstdio>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <cstdlib>
 #include <string>
 
@@ -59,6 +66,7 @@ EgressPolicy mkpolicy() {
     p.accepted_exits = {"203.0.113.9"};
     p.naked_exit     = "198.51.100.7";
     p.dns            = DnsMode::Proxied;
+    p.proxy          = "socks5h://127.0.0.1:1080";
     p.preflight_ttl_s = 300;
     return p;
 }
@@ -176,7 +184,7 @@ int run() {
               std::string("outcome '") + outcome_name(v) + "' survives name->from");
     for (auto v : {Reason::None, Reason::NoTunnel, Reason::Blocked, Reason::Captcha,
                    Reason::RateLimited, Reason::Timeout, Reason::BadResponse,
-                   Reason::UrlDead})
+                   Reason::UrlDead, Reason::NoRule, Reason::PageUnreadable})
         check(reason_from(reason_name(v)) == v,
               std::string("reason '") + reason_name(v) + "' survives name->from");
     for (auto v : {Field::Name, Field::Aliases, Field::Age, Field::Dob,
@@ -809,10 +817,23 @@ int run() {
     check(addr_canonical("nonsense").empty(), "an unreadable address has no comparison form");
 
     std::printf("\ndns mode round-trip\n");
-    for (auto m : {DnsMode::Unset, DnsMode::System, DnsMode::Pinned, DnsMode::Proxied})
+    for (auto m : {DnsMode::Unset, DnsMode::System, DnsMode::SystemVerified,
+                   DnsMode::Pinned, DnsMode::Proxied})
         check(dns_mode_from(dns_mode_name(m)) == m,
               std::string("dns mode '") + dns_mode_name(m) + "' survives name->from");
     check(dns_mode_from("whatever") == DnsMode::Unset, "an unrecognised mode reads as unset, not as system");
+    // The one that matters most in the file: a hand-edited "system" must not
+    // find its way into the permissive mode by any generosity of the reader.
+    check(dns_mode_from("system") == DnsMode::System,
+          "a hand-edited 'system' stays the refused value and does not upgrade itself");
+    check(dns_mode_from("system-verified") != DnsMode::System,
+          "and the checked mode is a different value, not a spelling of it");
+    check(dns_mode_from("systemverified") == DnsMode::Unset &&
+              dns_mode_from("system verified") == DnsMode::Unset &&
+              dns_mode_from("system_verified") == DnsMode::Unset,
+          "no near-spelling of it resolves -- unknown means unset means refused");
+    check(dns_mode_from("  SYSTEM-VERIFIED \n") == DnsMode::SystemVerified,
+          "case and whitespace are still forgiven, as everywhere else here");
 
     std::printf("\negress policy validation\n");
     check(egress_policy_validate(mkpolicy()).empty(), "a workable policy reports no problems");
@@ -839,6 +860,36 @@ int run() {
 
         p = mkpolicy(); p.preflight_ttl_s = 0;
         check(!egress_policy_validate(p).empty(), "a zero preflight lifetime is caught");
+
+        // ── s9 ───────────────────────────────────────────────────────────────
+        p = mkpolicy(); p.dns = DnsMode::SystemVerified;
+        check(!egress_policy_validate(p).empty(),
+              "system-verified with no recorded no-tunnel resolver is caught -- "
+              "without it the mode is 'system' with a better name");
+        p.naked_resolvers = {"198.51.100.60"};
+        check(egress_policy_validate(p).empty(),
+              "and with one recorded it is a clean policy");
+
+        p = mkpolicy(); p.naked_resolvers = {"192.168.1.1"};
+        check(!egress_policy_validate(p).empty(),
+              "a private recorded resolver is caught -- a resolver on the local "
+              "network is this computer's own by another name");
+        check(!naked_resolver_known(p),
+              "and it does not count as a baseline");
+        p.naked_resolvers.push_back("198.51.100.60");
+        check(naked_resolver_known(p),
+              "one usable entry beside a bad one is still a baseline");
+        check(!egress_policy_validate(p).empty(),
+              "and the bad entry is still reported, per entry, so it can be removed");
+
+        p = mkpolicy(); p.echo_url.clear();
+        check(!egress_policy_validate(p).empty(), "an empty address-check endpoint is caught");
+        p = mkpolicy(); p.echo_url = "javascript:alert(1)";
+        check(!egress_policy_validate(p).empty(), "and one that is not a url we would touch");
+        p = mkpolicy(); p.canary_url.clear();
+        check(!egress_policy_validate(p).empty(), "an empty lookup-check endpoint is caught");
+        p = mkpolicy(); p.canary_url = "file:///etc/passwd";
+        check(!egress_policy_validate(p).empty(), "and so is a scheme we would not fetch");
     }
 
     std::printf("\negress: the clear case\n");
@@ -866,6 +917,32 @@ int run() {
         p = mkpolicy(); p.accepted_exits.clear(); p.naked_exit.clear();
         check(egress_check(p, mkobs(), kNow) == Verdict::ExitUnpinned,
               "with nothing to compare against, the preflight cannot answer and we refuse");
+
+        // ── s9: the mode that is its own evidence ────────────────────────────
+        p = mkpolicy(); p.dns = DnsMode::SystemVerified; p.proxy.clear();
+        check(egress_check(p, mkobs(), kNow) == Verdict::ResolverBaselineMissing,
+              "system-verified refuses a PERFECT tunnel while the resolver "
+              "baseline is missing -- the canary is the whole of this mode's "
+              "guarantee and it cannot recognise a leak it has never seen");
+        p.naked_resolvers = {"192.168.1.1"};
+        check(egress_check(p, mkobs(), kNow) == Verdict::ResolverBaselineMissing,
+              "and an unusable baseline is not a baseline");
+        p.naked_resolvers = {"198.51.100.60"};
+        check(egress_check(p, mkobs(), kNow) == Verdict::Pass,
+              "with one recorded, the mode passes on a tunnel that passes");
+        // The proxy is not required here and its absence must not be borrowed
+        // from the mode next door.
+        check(p.proxy.empty(), "and it needed no proxy to do it");
+
+        p = mkpolicy(); p.canary_url.clear();
+        check(egress_check(p, mkobs(), kNow) == Verdict::CanaryDisabled,
+              "an emptied lookup-check endpoint refuses in every mode, and says "
+              "which box rather than blaming the preflight");
+        p = mkpolicy(); p.echo_url.clear();
+        check(egress_check(p, mkobs(), kNow) == Verdict::Pass,
+              "the echo endpoint gets no matching policy verdict on purpose -- "
+              "an empty one lands as ExitUnobserved when the preflight runs, "
+              "and the echo is never the guarantee for any mode");
     }
 
     std::printf("\negress: can anything leave off-tunnel\n");
@@ -962,7 +1039,8 @@ int run() {
                    Verdict::V6OffTunnel, Verdict::Stale, Verdict::ExitUnobserved,
                    Verdict::ExitPrivate, Verdict::ExitNaked, Verdict::ExitUnexpected,
                    Verdict::CanaryNotRun, Verdict::CanaryFailed, Verdict::CanaryLeaked,
-                   Verdict::ResolverMismatch}) {
+                   Verdict::ResolverMismatch, Verdict::ResolverBaselineMissing,
+                   Verdict::CanaryDisabled}) {
         const std::string name = verdict_name(v), text = verdict_text(v);
         check(!name.empty() && !text.empty(), std::string("verdict '") + name + "' has a name and a sentence");
         check(text.find('.') != std::string::npos, std::string("verdict '") + name + "' text is a sentence");
@@ -1001,6 +1079,1126 @@ int run() {
         check(apply_egress_refusal(k, "2026-03-01", 0).next_check == "2026-03-02",
               "a retry of zero days still comes back, tomorrow");
         check(apply_egress_refusal(k, "2026-03-01", 7).next_check == "2026-03-08", "a longer retry is honoured");
+    }
+
+    std::printf("\negress policy pump (round-trip fidelity)\n");
+    {
+        const std::string f = tmp_path("delr_selftest_egress.json");
+
+        EgressPolicy p = mkpolicy();
+        p.accepted_exits.push_back("203.0.113.44");   // providers rotate exits
+        p.naked_resolvers = {"198.51.100.60", "198.51.100.61"};   // and pool their resolvers
+        p.tunnel_devs = {"surfshark_ipv6"};   // and split a tunnel across devices
+        p.preflight_ttl_s = 120;
+        check(egress_policy_save(f, p), "a policy saves");
+
+        std::string perr;
+        const EgressPolicy back = egress_policy_load(f, &perr);
+        check(perr.empty(), "and loads without complaint");
+        check(back.interface_name == p.interface_name, "the interface survives");
+        check(back.accepted_exits == p.accepted_exits,
+              "the whole exit LIST survives, in order -- a policy that lost the "
+              "second exit would refuse the app the next time the provider rotated");
+        check(back.naked_exit == p.naked_exit, "the baseline survives");
+        check(back.naked_device == p.naked_device,
+              "and so does what it was recorded ON -- without it the setup path "
+              "cannot tell a tunnel that is up from one that is not, and the box "
+              "goes back to empty on every launch");
+        check(back.naked_resolvers == p.naked_resolvers,
+              "and so does the whole resolver LIST -- a policy that dropped the "
+              "second entry would wave a leak through the sibling resolver while "
+              "reporting itself verified");
+        check(back.tunnel_devs == p.tunnel_devs,
+              "the tunnel's other devices survive -- losing them re-refuses a "
+              "split tunnel with V6OffTunnel, which is the bug this fixed");
+        check(back.echo_url == p.echo_url && back.canary_url == p.canary_url,
+              "the preflight endpoints survive, which is what they became "
+              "settings for");
+        check(back.dns == p.dns, "the dns mode survives");
+        check(back.proxy == p.proxy, "the proxy survives with its 'h' intact");
+        check(back.preflight_ttl_s == p.preflight_ttl_s, "and so does the ttl");
+        check(egress_policy_validate(back).empty(),
+              "and what comes back off disk still passes validation");
+        check(egress_check(back, mkobs(), kNow) == Verdict::Pass,
+              "and still passes the check it passed before it was written");
+
+        // The file is 0600, and the reason is that it contains naked_exit.
+        std::error_code pec;
+        const auto perms = std::filesystem::status(f, pec).permissions();
+        check(!pec && (perms & (std::filesystem::perms::group_all |
+                                std::filesystem::perms::others_all)) ==
+                          std::filesystem::perms::none,
+              "the policy file is readable by nobody but its owner -- it holds "
+              "this machine's home address");
+
+        // Fidelity includes the values we refuse. A hand-edited 'system' must
+        // arrive as System and be refused BY NAME, not sanitised into Unset and
+        // refused for the wrong reason.
+        const std::string sysf = tmp_path("delr_selftest_egress_system.json");
+        { std::ofstream o(sysf);
+          o << R"({"version":1,"egress":{"interface":"wg0","dns":"system"}})"; }
+        const EgressPolicy sysp = egress_policy_load(sysf);
+        check(sysp.echo_url == EgressPolicy{}.echo_url &&
+                  sysp.canary_url == EgressPolicy{}.canary_url,
+              "a policy written before s9 has no endpoint keys and keeps the "
+              "shipped ones -- an absent key is a file from another version");
+        check(sysp.naked_resolvers.empty(),
+              "and no resolver baseline, which is what refuses system-verified");
+        check(sysp.dns == DnsMode::System,
+              "a hand-edited 'system' loads as system rather than being tidied away");
+        check(egress_check(sysp, mkobs(), kNow) == Verdict::DnsSystem,
+              "so the refusal names the actual problem: the host resolver");
+        std::remove(sysf.c_str());
+
+        // Anything nobody has heard of has no honest sentence to say about it.
+        const std::string junkf = tmp_path("delr_selftest_egress_junk.json");
+        { std::ofstream o(junkf);
+          o << R"({"version":1,"egress":{"interface":"wg0","dns":"telepathy"}})"; }
+        // Absent and present-but-empty are different facts. A person who
+        // cleared the lookup-check box meant it, and a loader that helpfully
+        // restored the default would switch a check back on behind them --
+        // silently, since the only visible effect is that checks stop refusing.
+        const std::string emptyf = tmp_path("delr_selftest_egress_empty.json");
+        { std::ofstream o(emptyf);
+          o << R"({"version":1,"egress":{"interface":"wg0","dns":"proxied",)"
+               R"("proxy":"socks5h://127.0.0.1:1080",)"
+               R"("naked_exit":"198.51.100.7","canary_url":""}})"; }
+        const EgressPolicy emptyp = egress_policy_load(emptyf);
+        check(emptyp.canary_url.empty(),
+              "an endpoint cleared on purpose stays cleared across a load");
+        check(emptyp.echo_url == EgressPolicy{}.echo_url,
+              "while the key that was never written still defaults");
+        check(egress_check(emptyp, mkobs(), kNow) == Verdict::CanaryDisabled,
+              "and the emptied one refuses by name, which is the point of "
+              "keeping the two apart");
+        std::remove(emptyf.c_str());
+
+        check(egress_policy_load(junkf).dns == DnsMode::Unset,
+              "but an unrecognised mode falls to unset, which refuses");
+        std::remove(junkf.c_str());
+
+        // First run, and a broken file. Both must land on the policy that
+        // refuses everything rather than on a half-filled one.
+        std::string merr;
+        const EgressPolicy missing =
+            egress_policy_load(tmp_path("delr_no_such_egress.json"), &merr);
+        check(merr.empty() && missing.interface_name.empty() &&
+                  missing.dns == DnsMode::Unset,
+              "a missing policy file is first-run, not an error -- and first-run "
+              "is the policy that allows nothing");
+        check(egress_check(missing, mkobs(), kNow) != Verdict::Pass,
+              "which refuses");
+
+        const std::string badf = tmp_path("delr_selftest_egress_bad.json");
+        { std::ofstream o(badf); o << "{ this is not json"; }
+        std::string berr;
+        const EgressPolicy bad = egress_policy_load(badf, &berr);
+        check(!berr.empty() && bad.interface_name.empty(),
+              "and malformed JSON reports rather than half-loading");
+        std::remove(badf.c_str());
+
+        std::remove(f.c_str());
+    }
+
+    std::printf("\nthe v6 routing table\n");
+    {
+        // /proc/net/ipv6_route, as the kernel writes it: ten fields, hex,
+        // dest / dest_len / src / src_len / next_hop / metric / refcnt / use /
+        // flags / dev.
+        const std::string zeros(32, '0');
+        auto line = [&](const std::string& dest, const char* dlen, const char* flags,
+                        const char* dev) {
+            return dest + " " + dlen + " " + zeros + " 00 " + zeros +
+                   " 00000400 00000000 00000000 " + flags + " " + dev + "\n";
+        };
+        const std::string via_wg0  = line(zeros, "00", "00000001", "wg0");
+        const std::string via_eth0 = line(zeros, "00", "00000003", "eth0");
+        // A /64 on the local segment is not a way out.
+        const std::string lan = line("20010db8000000000000000000000000", "40", "00000001", "eth0");
+
+        check(v6_default_route("", "wg0") == V6Route::None, "an empty table routes nothing");
+        check(v6_default_route(lan, "wg0") == V6Route::None, "a /64 is not a default route");
+        check(v6_default_route(via_wg0, "wg0") == V6Route::TunnelOnly,
+              "a default route out the tunnel is the one we want");
+        check(v6_default_route(via_eth0, "wg0") == V6Route::OffTunnel,
+              "a default route out anything else is the leak");
+        check(v6_default_route(via_wg0 + via_eth0, "wg0") == V6Route::OffTunnel,
+              "and one leak outranks any number of good routes");
+        check(v6_default_route(lan + via_wg0, "wg0") == V6Route::TunnelOnly,
+              "other routes do not distract from the default");
+
+        // ── a tunnel that is more than one device ────────────────────────────
+        // Surfshark's WireGuard carries v4 on `surfshark_wg` and v6 on
+        // `surfshark_ipv6`. The v6 default goes out a device that is not the
+        // bind device, and reading that as a leak refuses a machine whose
+        // traffic is entirely inside the tunnel. Found by pointing the app at
+        // a real VPN for the first time; every hermetic check before this one
+        // agreed with the assumption, because they were written by whoever
+        // made it.
+        const std::string via_v6dev = line(zeros, "00", "00000001", "surfshark_ipv6");
+        check(v6_default_route(via_v6dev, "surfshark_wg") == V6Route::OffTunnel,
+              "a sibling device is a leak when nobody said it was the tunnel");
+        check(v6_default_route(via_v6dev, "surfshark_wg", {"surfshark_ipv6"}) ==
+                  V6Route::TunnelOnly,
+              "and is not, once it is named -- the refusal a real VPN hit");
+        check(v6_default_route(via_v6dev + via_eth0, "surfshark_wg", {"surfshark_ipv6"}) ==
+                  V6Route::OffTunnel,
+              "naming a sibling widens the tunnel and does not blind the check");
+        check(v6_default_route(via_eth0, "surfshark_wg", {"surfshark_ipv6"}) ==
+                  V6Route::OffTunnel,
+              "a device nobody named is still a leak with a list present");
+        check(v6_default_route(via_wg0, "wg0", {}) == V6Route::TunnelOnly,
+              "an empty list is exactly the behaviour that shipped before it");
+        check(v6_default_route(via_v6dev, "", {"surfshark_ipv6"}) == V6Route::TunnelOnly,
+              "the list stands alone -- it is not a modifier on the bind device");
+        check(v6_default_route(via_v6dev, "surfshark_wg", {" surfshark_ipv6 "}) ==
+                  V6Route::TunnelOnly,
+              "and a name typed with spaces around it is the same name");
+        check(v6_default_route(via_eth0, "surfshark_wg", {""}) == V6Route::OffTunnel,
+              "an empty entry matches nothing rather than everything");
+        check(v6_default_route(via_v6dev, "surfshark_wg", {"surfshark_ipv"}) ==
+                  V6Route::OffTunnel,
+              "matching is exact: a prefix of the name is not the name");
+
+        // An unreachable default is the OPPOSITE of a leak, and it is what a
+        // v6-less host looks like when the file exists anyway.
+        check(v6_default_route(line(zeros, "00", "00000201", "lo"), "wg0") == V6Route::None,
+              "a reject route on lo is refusal, not egress");
+        check(v6_default_route(line(zeros, "00", "00000203", "eth0"), "wg0") == V6Route::None,
+              "a reject route anywhere is refusal, not egress");
+        check(v6_default_route(line(zeros, "00", "00000002", "eth0"), "wg0") == V6Route::None,
+              "a route that is not up cannot carry anything");
+
+        check(v6_default_route("not a routing table at all\n", "wg0") == V6Route::Unreadable,
+              "content we cannot make ten fields of is unreadable, not clean");
+        check(v6_default_route("garbage\n" + via_wg0, "wg0") == V6Route::TunnelOnly,
+              "but one bad line among readable ones does not blind us");
+        check(v6_default_route(via_eth0, "eth0") == V6Route::TunnelOnly,
+              "the tunnel is whichever interface the policy named");
+    }
+
+    std::printf("\nwhich device would a packet leave by (the setup path's hint)\n");
+    {
+        const std::vector<DeviceAddress> host = {
+            {"lo",   "127.0.0.1"},
+            {"eth0", "192.168.1.40"},
+            {"eth0", "fe80::a11"},
+            {"wg0",  "10.7.0.2"},
+        };
+
+        check(device_for_address("10.7.0.2", host).state == Detect::Found,
+              "the address the kernel would send from names a device");
+        check(device_for_address("10.7.0.2", host).device == "wg0",
+              "and it is the right one");
+        check(device_for_address("192.168.1.40", host).device == "eth0",
+              "the ordinary connection resolves the same way");
+
+        // The whole point of asking the kernel: whichever device it picked is
+        // the answer, with no opinion here about which one SHOULD have carried
+        // it. A detector that preferred a name would be the guess this replaced.
+        check(device_for_address(" 10.7.0.2 ", host).device == "wg0",
+              "whitespace is not part of an address");
+        check(device_for_address("fe80::a11%wg0", host).device == "eth0",
+              "a scope id identifies an interface, not an address, and is not "
+              "matched on");
+
+        check(device_for_address("127.0.0.1", host).state == Detect::NoRoute,
+              "an address only loopback claims means the packet went nowhere -- "
+              "and `lo` must never be offered as a tunnel to paste into a box");
+        check(device_for_address("203.0.113.9", host).state == Detect::Unmatched,
+              "an address no interface here claims is unmatched, which is a "
+              "different problem from having no route");
+        check(device_for_address("", host).state == Detect::NotRun,
+              "nothing to match on is not an answer");
+
+        // Two devices, one address. Real enough to matter (a bridge, a stale
+        // duplicate) and the one case where guessing would write the wrong name
+        // into the field that decides where every socket binds.
+        const std::vector<DeviceAddress> twice = {
+            {"eth0", "192.168.1.40"}, {"eth1", "192.168.1.40"}};
+        check(device_for_address("192.168.1.40", twice).state == Detect::Ambiguous,
+              "two devices claiming one address is refused, not resolved by "
+              "picking the first");
+        const std::vector<DeviceAddress> dupe = {
+            {"eth0", "192.168.1.40"}, {"eth0", "192.168.1.40"}};
+        check(device_for_address("192.168.1.40", dupe).state == Detect::Found,
+              "but the same device listed twice is one device, which getifaddrs "
+              "does routinely");
+
+        // `lo` never wins, even when something else is available -- it is
+        // skipped rather than ranked.
+        const std::vector<DeviceAddress> shared = {
+            {"lo", "10.7.0.2"}, {"wg0", "10.7.0.2"}};
+        check(device_for_address("10.7.0.2", shared).device == "wg0",
+              "loopback is never the way out");
+    }
+
+    std::printf("\nis the detected device plausibly a tunnel\n");
+    {
+        const DeviceFound wg{Detect::Found, "wg0"};
+        const DeviceFound eth{Detect::Found, "eth0"};
+        const DeviceFound none{Detect::NoRoute, ""};
+
+        check(tunnel_check(wg, "eth0") == TunnelCheck::Distinct,
+              "a device that is not the one the baseline was recorded on is "
+              "consistent with a tunnel");
+        check(tunnel_check(eth, "eth0") == TunnelCheck::NotUp,
+              "the very device the baseline was recorded on means the VPN is "
+              "off -- the guard that stops `eth0` being written in as a tunnel");
+        check(tunnel_check(eth, " eth0 ") == TunnelCheck::NotUp,
+              "and trimming is not a way around it");
+        check(tunnel_check(wg, "") == TunnelCheck::Unchecked,
+              "with no baseline device there is nothing to compare against, and "
+              "saying so beats implying a check that did not happen");
+        check(tunnel_check(none, "eth0") == TunnelCheck::NoDevice,
+              "nothing detected is nothing to judge");
+        check(tunnel_check({Detect::Found, ""}, "eth0") == TunnelCheck::NoDevice,
+              "a Found with no name is not a device, whatever it claims");
+
+        // Distinct is NOT a claim that the tunnel works. The proof is a
+        // preflight, two steps later, and nothing here may stand in for it.
+        check(tunnel_check(wg, "eth0") != TunnelCheck::NotUp,
+              "and `Distinct` only ever rules the one thing out");
+    }
+
+    std::printf("\nwhich address is the tunnel's own\n");
+    {
+        check(iface_pick_address({}) == "", "an interface with no addresses has none to bind");
+        check(iface_pick_address({"fe80::a11%wg0"}) == "",
+              "link-local is not an address you can leave through");
+        check(iface_pick_address({"127.0.0.1"}) == "", "nor is loopback");
+        check(iface_pick_address({"fe80::a11%wg0", "10.7.0.2"}) == "10.7.0.2",
+              "the tunnel's v4 is the address both sides will name");
+        check(iface_pick_address({"fd00::2", "10.7.0.2"}) == "10.7.0.2",
+              "v4 wins outright, whatever the order");
+        check(iface_pick_address({"fe80::a11%wg0", "fd00::2"}) == "fd00::2",
+              "a v6-only tunnel still has one usable address");
+        check(iface_pick_address({" 10.7.0.2 "}) == "10.7.0.2", "whitespace is not part of it");
+        check(iface_pick_address({"010.7.0.2"}) == "",
+              "an ambiguous address is not an address (leading zero)");
+    }
+
+    std::printf("\nwhat the preflight echo said\n");
+    {
+        check(echo_read("203.0.113.9\n") == "203.0.113.9", "a bare answer is the easy case");
+        check(echo_read("{\"ip\":\"203.0.113.9\"}") == "203.0.113.9", "so is a scrap of JSON");
+        check(echo_read("Your IP address is 203.0.113.9.") == "203.0.113.9",
+              "a trailing full stop is punctuation, not an octet");
+        check(echo_read("203.0.113.9 203.0.113.9") == "203.0.113.9",
+              "the same address twice is still one answer");
+        check(echo_read("2001:db8::1\n") == "2001:db8::1", "v6 reads the same way");
+        check(echo_read("") == "", "an empty body says nothing");
+        check(echo_read("could not determine your address") == "", "and neither does prose");
+        // 1.0.0.1 is a valid address AND a version number. An echo that needs
+        // disambiguating is pointed at the wrong service.
+        check(echo_read("delr 1.0.0.1 -- you are 203.0.113.9") == "",
+              "two readable addresses is ambiguity, and ambiguity is no answer");
+        check(echo_read(std::string(5000, ' ') + "203.0.113.9") == "",
+              "an answer buried past 4k is not an echo service");
+        check(addr_kind(echo_read("10.0.0.4\n")) == AddrKind::Private,
+              "a private echo is read, not discarded -- ExitPrivate is a real verdict");
+    }
+
+    std::printf("\nwhat the DNS canary said\n");
+    {
+        const std::string naked = "198.51.100.7";
+        const std::vector<std::string> none;
+        check(canary_read("203.0.113.10", naked, none) == Canary::Clean,
+              "a public answer that is not ours went out with the tunnel");
+        check(canary_read(naked, naked, none) == Canary::Leaked,
+              "our own address asking is the leak this exists to see");
+        check(canary_read("192.168.1.1", naked, none) == Canary::Leaked,
+              "so is something inside the building answering");
+        check(canary_read("127.0.0.1", naked, none) == Canary::Leaked, "and so is a local stub");
+        check(canary_read("", naked, none) == Canary::Failed, "no answer is not evidence of safety");
+        check(canary_read("nonsense", naked, none) == Canary::Failed, "nor is an unreadable one");
+        check(canary_read("203.0.113.10", "", none) == Canary::Clean,
+              "with no baseline, public and readable is the whole of what can be known");
+        check(canary_read("198.51.100.7 ", naked, none) == Canary::Leaked, "whitespace does not launder it");
+
+        // ── s9: the resolver baseline, which is what makes SystemVerified a
+        // mode rather than a rename of System. Every one of these answers is a
+        // perfectly ordinary public address; the ONLY thing that tells them
+        // apart is having watched them with the tunnel off.
+        const std::vector<std::string> isp = {"198.51.100.60", "198.51.100.61"};
+        check(canary_read("198.51.100.60", naked, isp) == Canary::Leaked,
+              "a resolver that answers with the tunnel down, answering with it "
+              "up, is the ordinary leak -- and it is a public address that "
+              "looks like nothing in particular");
+        check(canary_read("198.51.100.61", naked, isp) == Canary::Leaked,
+              "and so is the SECOND one in the pool, which is the entire reason "
+              "this is a list: recognising only the sampled resolver would wave "
+              "its sibling through while looking verified");
+        check(canary_read("203.0.113.10", naked, isp) == Canary::Clean,
+              "a resolver never seen without the tunnel is the tunnel's, as far "
+              "as this can honestly tell");
+        check(canary_read("198.51.100.60", "", isp) == Canary::Leaked,
+              "the resolver baseline stands on its own -- no exit baseline needed");
+        check(canary_read("198.51.100.60 ", naked, isp) == Canary::Leaked,
+              "whitespace does not launder this one either");
+        check(canary_read("::ffff:198.51.100.60", naked, isp) == Canary::Leaked,
+              "nor does a v4-in-v6 spelling of the same address");
+
+        // Both baselines are used ONLY to fail. A garbage baseline removes a way
+        // to catch a leak; it can never manufacture one, and it can never
+        // manufacture a pass either.
+        const std::vector<std::string> junk = {"", "nonsense", "10.0.0.1", "127.0.0.1"};
+        check(canary_read("203.0.113.10", naked, junk) == Canary::Clean,
+              "unreadable and private entries in the baseline match nothing");
+        check(canary_read("10.0.0.1", naked, junk) == Canary::Leaked,
+              "and a private answer is still the leak, by the rule that was "
+              "always there rather than by matching the junk");
+    }
+
+    std::printf("\nreadings become an observation\n");
+    {
+        const EgressPolicy p = mkpolicy();
+        const std::string zeros(32, '0');
+        const std::string via_wg0 = zeros + " 00 " + zeros + " 00 " + zeros +
+                                    " 00000400 00000000 00000000 00000001 wg0\n";
+        const std::string via_eth0 = zeros + " 00 " + zeros + " 00 " + zeros +
+                                     " 00000400 00000000 00000000 00000003 eth0\n";
+
+        // What the shim reports when everything is exactly right.
+        ProbeReadings r;
+        r.interface_present   = true;
+        r.interface_up        = true;
+        r.interface_addresses = {"fe80::a11%wg0", "10.7.0.2"};
+        r.bound         = true;
+        r.bound_address = "10.7.0.2";
+        r.routes        = ProbeReadings::RouteSource::Text;
+        r.routes_text   = via_wg0;
+        r.echo_ran      = true;
+        r.echo_body     = "203.0.113.9\n";
+        r.canary_ran    = true;
+        r.canary_answered_by = "203.0.113.10";
+        r.observed_at_s = 1000;
+
+        const EgressObservation o = observation_from(r, p);
+        check(o.interface_address == "10.7.0.2", "the observation names the tunnel's own address");
+        check(o.bound_address == "10.7.0.2", "and the address the socket actually got");
+        check(!o.v6_default_offtunnel, "a tunnel-only route table is not a leak");
+        check(o.observed_exit == "203.0.113.9", "the echo becomes the observed exit");
+        check(o.canary == Canary::Clean, "the whoami becomes the canary");
+        check(egress_check(p, o, 1100) == Verdict::Pass,
+              "and honest readings from a healthy tunnel pass the policy");
+
+        // A default-constructed observer has looked at nothing, and must not
+        // pass on silence.
+        const EgressObservation blind = observation_from(ProbeReadings{}, p);
+        check(!blind.interface_present && !blind.bound, "unread fields stay unread");
+        check(blind.v6_default_offtunnel, "and an unread routing table fails closed");
+        check(blind.canary == Canary::NotRun, "a canary nobody ran did not pass");
+        check(!egress_may_fetch(p, blind, 1100), "a blind observer never allows a fetch");
+
+        // One thing wrong at a time, each landing on its own verdict.
+        ProbeReadings v6 = r; v6.routes_text = via_wg0 + via_eth0;
+        check(egress_check(p, observation_from(v6, p), 1100) == Verdict::V6OffTunnel,
+              "a v6 default around the tunnel refuses, tunnel up and all");
+
+        ProbeReadings unread = r; unread.routes = ProbeReadings::RouteSource::Unread;
+        check(egress_check(p, observation_from(unread, p), 1100) == Verdict::V6OffTunnel,
+              "a routing table nobody read refuses the same way");
+
+        ProbeReadings nov6 = r; nov6.routes = ProbeReadings::RouteSource::Absent;
+        check(egress_check(p, observation_from(nov6, p), 1100) == Verdict::Pass,
+              "but a kernel with no v6 at all has nothing to leak, and is not punished");
+
+        ProbeReadings naked = r; naked.echo_body = p.naked_exit;
+        check(egress_check(p, observation_from(naked, p), 1100) == Verdict::ExitNaked,
+              "an echo of our own address is the refusal the module exists for");
+
+        ProbeReadings leak = r; leak.canary_answered_by = p.naked_exit;
+        check(egress_check(p, observation_from(leak, p), 1100) == Verdict::CanaryLeaked,
+              "a lookup that went out naked refuses, HTTP notwithstanding");
+
+        ProbeReadings noecho = r; noecho.echo_ran = false;
+        check(egress_check(p, observation_from(noecho, p), 1100) == Verdict::ExitUnobserved,
+              "a preflight that did not echo produced no exit to judge");
+
+        ProbeReadings nocanary = r; nocanary.canary_ran = false;
+        check(egress_check(p, observation_from(nocanary, p), 1100) == Verdict::CanaryNotRun,
+              "and one that did not look up names cannot say the lookup was clean");
+
+        // ── s9: the whole SystemVerified path, readings to verdict ───────────
+        // The point of these four is that the readings are IDENTICAL to the
+        // healthy ones above except for the resolver that answered, and that
+        // resolver is an ordinary public address. Before the baseline existed,
+        // every one of these read as Clean.
+        {
+            EgressPolicy sv = mkpolicy();
+            sv.dns = DnsMode::SystemVerified;
+            sv.proxy.clear();
+            sv.naked_resolvers = {"198.51.100.60", "198.51.100.61"};
+
+            check(egress_check(sv, observation_from(r, sv), 1100) == Verdict::Pass,
+                  "system-verified passes on a tunnel whose lookups are answered "
+                  "by a resolver never seen without it");
+
+            ProbeReadings isp = r; isp.canary_answered_by = "198.51.100.60";
+            check(egress_check(sv, observation_from(isp, sv), 1100) == Verdict::CanaryLeaked,
+                  "and refuses when the resolver that answers without the tunnel "
+                  "answers with it up -- the ordinary leak, invisible until s9");
+
+            ProbeReadings sibling = r; sibling.canary_answered_by = "198.51.100.61";
+            check(egress_check(sv, observation_from(sibling, sv), 1100) == Verdict::CanaryLeaked,
+                  "including via the sibling in the pool, which a single recorded "
+                  "resolver would have waved through while reporting verified");
+
+            EgressPolicy one = sv; one.naked_resolvers = {"198.51.100.60"};
+            check(egress_check(one, observation_from(sibling, one), 1100) == Verdict::Pass,
+                  "and that is not a hypothetical: with only the first recorded, "
+                  "the very same leak passes");
+        }
+
+        ProbeReadings unbound = r; unbound.bound = false; unbound.bound_address = "";
+        check(egress_check(p, observation_from(unbound, p), 1100) == Verdict::NotBound,
+              "a socket that did not bind is the killswitch working");
+
+        ProbeReadings other = r; other.interface_addresses = {"10.7.0.9"};
+        check(egress_check(p, observation_from(other, p), 1100) == Verdict::BindMismatch,
+              "and a bind to something that is not the tunnel's address is caught");
+
+        // Pinned resolvers: the address we SENT to is the one the policy
+        // compares, not the address the whoami reported back.
+        EgressPolicy pin = p;
+        pin.dns = DnsMode::Pinned;
+        pin.resolver = "10.7.0.1";
+        ProbeReadings pr = r;
+        check(egress_check(pin, observation_from(pr, pin), 1100) == Verdict::ResolverMismatch,
+              "an unreported resolver cannot satisfy a pinned policy");
+        pr.resolver_used = "10.7.0.1";
+        check(egress_check(pin, observation_from(pr, pin), 1100) == Verdict::Pass,
+              "the resolver we asked is the one the policy checks");
+        pr.resolver_used = "9.9.9.9";
+        check(egress_check(pin, observation_from(pr, pin), 1100) == Verdict::ResolverMismatch,
+              "and asking a different one is a mismatch even when the canary is clean");
+    }
+
+    // ── PageRules: what makes a fetched page a NotFound ──────────────────────
+
+    std::printf("\npage text normalising\n");
+    check(page_text("<p>No <b>results</b> found.</p>") == "no results found.",
+          "tags come out and the words survive");
+    check(page_text("a<br>b") == "a b",
+          "a tag is a word boundary, not a deletion");
+    check(page_text("No&nbsp;results") == "no results",
+          "&nbsp; is a space like any other");
+    check(page_text("Smith &amp; Sons") == "smith & sons",
+          "an entity we know decodes; one we do not stays literal");
+    check(page_text("R&D dept") == "r&d dept",
+          "a bare ampersand is not an entity and is not eaten");
+    check(page_text("<script>var s='no results found';</script>Listed") == "listed",
+          "a marker inside a script matches the site's code, not its page");
+    check(page_text("<style>.x{content:'no results'}</style>Listed") == "listed",
+          "and the same for a stylesheet");
+    check(page_text("<!-- no results found --><p>Listed</p>") == "listed",
+          "a comment is skipped to its terminator, markup inside it and all");
+    check(page_text("  A\n\t B  ") == "a b",
+          "whitespace collapses and the ends are trimmed");
+    check(page_text("").empty() && page_text("<div></div>").empty(),
+          "a page with no text has no text");
+
+    std::printf("\npage marker matching\n");
+    {
+        const std::string t = page_text("<h1>No Results Found</h1>");
+        check(page_contains(t, "no results found"), "a marker matches its page");
+        check(page_contains(t, "No&nbsp;Results"),
+              "the marker is normalised too, so an author can write it either way");
+        check(!page_contains(t, ""),
+              "an empty marker matches nothing -- that is how a rules file "
+              "silently starts reporting every page as a hit");
+    }
+
+    std::printf("\npage rule validation\n");
+    {
+        PageRule ok;
+        ok.broker_id   = "acme";
+        ok.fingerprint = {"acme people search"};
+        ok.present     = {"view full report"};
+        ok.absent      = {"no results found"};
+        ok.reviewed    = "2026-08-01";
+
+        check(rules_validate({ok}).empty(), "a complete rule validates clean");
+
+        PageRule nofp = ok; nofp.fingerprint.clear();
+        check(rules_validate({nofp}).size() == 1,
+              "a rule with no fingerprint cannot tell the broker's page from a "
+              "login wall, and is refused");
+
+        PageRule noabs = ok; noabs.absent.clear();
+        check(rules_validate({noabs}).size() == 1,
+              "and one with no absent marker can never report a removal");
+
+        PageRule tiny = ok; tiny.absent = {"no"};
+        check(rules_validate({tiny}).size() == 1, "a two-letter marker is caught");
+
+        PageRule both = ok; both.absent.push_back("View Full Report");
+        check(rules_validate({both}).size() == 1,
+              "a string in both lists guarantees Ambiguous forever while "
+              "looking configured");
+
+        PageRule dated = ok; dated.reviewed = "2026-13-40";
+        check(rules_validate({dated}).size() == 1, "a malformed review date is caught");
+
+        PageRule anon = ok; anon.broker_id.clear();
+        check(!rules_validate({anon}).empty(), "a rule with no broker is caught");
+        check(rules_validate({ok, ok}).size() == 1, "and so is a duplicate");
+
+        Roster r = {mk("acme", Method::Web)};
+        check(rules_validate({ok}, &r).empty(), "a rule for a known broker is fine");
+        Roster other = {mk("notacme", Method::Web)};
+        check(rules_validate({ok}, &other).size() == 1,
+              "a rule for a broker the roster has never heard of is a dead entry");
+
+        check(rules_find({ok}, "acme") != nullptr && rules_find({ok}, "nope") == nullptr,
+              "lookup answers, and answers null when it has nothing");
+    }
+
+    std::printf("\nrule freshness\n");
+    {
+        PageRule r;
+        r.reviewed = "2026-08-01";
+        check(rule_age_days(r, "2026-08-17") == 16, "age is counted in days");
+        check(!rule_stale(r, "2026-08-17"), "a rule read this month is not stale");
+        check(rule_stale(r, "2027-09-01"), "one read two summers ago is");
+        check(rule_age_days(r, "2026-07-01") == -1, "a review in the future is unusable");
+        PageRule never;
+        check(rule_age_days(never, "2026-08-17") == -1 && rule_stale(never, "2026-08-17"),
+              "a rule nobody has ever read counts as stale, not as fresh");
+    }
+
+    std::printf("\npage verdicts: the status comes first\n");
+    {
+        PageRule r;
+        r.broker_id = "acme";
+        r.fingerprint = {"acme people search"};
+        r.present = {"view full report"};
+        r.absent  = {"no results found"};
+
+        // The body says "no results found" every time below. A refused request
+        // is not a page about the listing, and reading it as one is how a bot
+        // wall becomes a removal.
+        const std::string body =
+            "<html><body><h1>Acme People Search</h1><p>No results found.</p></body></html>";
+
+        check(page_check(&r, 403, body) == PageVerdict::HttpBlocked,
+              "a 403's body belongs to the bot wall, not to the broker's page");
+        check(page_check(&r, 429, body) == PageVerdict::HttpThrottled,
+              "a 429 is the site asking us to slow down");
+        check(page_check(&r, 503, body) == PageVerdict::HttpServerError,
+              "a 5xx is their failure, not an answer");
+        check(page_check(&r, 404, body) == PageVerdict::HttpDead,
+              "a 404 is never a removal -- brokers retire slugs and re-serve "
+              "the same record under a new one");
+        check(page_check(&r, 410, body) == PageVerdict::HttpDead, "and 410 with it");
+        check(page_check(&r, 302, body) == PageVerdict::HttpUnexpected,
+              "an unfollowed redirect is not a page");
+        check(page_check(&r, 0, body) == PageVerdict::NoResponse,
+              "and no response at all is not a page either");
+        check(page_check(&r, 200, body) == PageVerdict::Absent,
+              "the same body at 200 is the answer we came for");
+    }
+
+    std::printf("\npage verdicts: is this even the right page\n");
+    {
+        PageRule r;
+        r.broker_id = "acme";
+        r.fingerprint = {"acme people search"};
+        r.present = {"view full report"};
+        r.absent  = {"no results found"};
+
+        check(page_check(nullptr, 200, "anything") == PageVerdict::NoRule,
+              "no rule means the listing was reached but not read");
+        check(page_check(&r, 200, "") == PageVerdict::Empty,
+              "a 200 with no text is not a page");
+        check(page_check(&r, 200, "<html><body>Sign in to continue</body></html>")
+                  == PageVerdict::Unfingerprinted,
+              "a login wall does not carry the broker's chrome, and without the "
+              "fingerprint it would have read as a clean absence");
+        check(page_check(&r, 200,
+                  "<h1>Acme People Search</h1><p>Welcome to our new site!</p>")
+                  == PageVerdict::Silent,
+              "the broker's page saying neither thing is a rotted rule, not a verdict");
+        check(page_check(&r, 200,
+                  "<h1>Acme People Search</h1><p>No results found.</p>"
+                  "<a>View full report</a>") == PageVerdict::Ambiguous,
+              "a page that reads as both is a broken rule -- picking a winner "
+              "would be picking which lie to tell");
+    }
+
+    std::printf("\npage verdicts: the listing's own details\n");
+    {
+        PageRule r;
+        r.broker_id = "acme";
+        r.fingerprint = {"acme people search"};
+        r.present = {"view full report"};
+        r.absent  = {"no results found"};
+        r.needs_needle = true;
+
+        PageNeedles n;
+        n.terms = {"jane q public", "centerville"};
+
+        const std::string mine =
+            "<h1>Acme People Search</h1><h2>Jane Q Public</h2>"
+            "<p>Centerville, TN</p><a>View full report</a>";
+        const std::string someone_else =
+            "<h1>Acme People Search</h1><h2>John Smith</h2><a>View full report</a>";
+
+        check(page_check(&r, 200, mine, n) == PageVerdict::Present,
+              "the presence marker plus the person is a sighting");
+        check(page_check(&r, 200, someone_else, n) == PageVerdict::NeedleAbsent,
+              "the presence marker WITHOUT the person is the template, not the "
+              "listing -- and on a per-person page that is an absence");
+        check(page_check(&r, 200,
+                  "<h1>Acme People Search</h1><p>Nothing here.</p>", n)
+                  == PageVerdict::NeedleAbsent,
+              "so is the broker's page with no markers and none of the details");
+        check(page_check(&r, 200, mine) == PageVerdict::NoNeedles,
+              "a rule that checks identity and gets no identity refuses rather "
+              "than falling back to the marker");
+        check(page_check(&r, 200,
+                  "<h1>Acme People Search</h1><p>No results found.</p>", n)
+                  == PageVerdict::Absent,
+              "and the broker's own words about absence still outrank ours");
+
+        PageNeedles all = n;
+        all.require_all = true;
+        check(page_check(&r, 200,
+                  "<h1>Acme People Search</h1><h2>Jane Q Public</h2>"
+                  "<a>View full report</a>", all) == PageVerdict::NeedleAbsent,
+              "under require_all, a listing missing one term is not confirmed");
+
+        PageRule loose = r;
+        loose.needs_needle = false;
+        check(page_check(&loose, 200, someone_else, n) == PageVerdict::Present,
+              "a rule that did not opt into identity matching cannot use it, "
+              "and reports the marker it was given");
+        check(page_check(&loose, 200,
+                  "<h1>Acme People Search</h1><p>Nothing here.</p>", n)
+                  == PageVerdict::Silent,
+              "nor may it infer an absence from details it was never told to check");
+    }
+
+    std::printf("\npage verdicts are nameable and say nothing\n");
+    {
+        const PageVerdict all[] = {
+            PageVerdict::Present, PageVerdict::Absent, PageVerdict::NeedleAbsent,
+            PageVerdict::NoRule, PageVerdict::NoNeedles, PageVerdict::Unfingerprinted,
+            PageVerdict::Ambiguous, PageVerdict::Silent, PageVerdict::Empty,
+            PageVerdict::NoResponse, PageVerdict::HttpDead, PageVerdict::HttpBlocked,
+            PageVerdict::HttpThrottled, PageVerdict::HttpServerError,
+            PageVerdict::HttpUnexpected};
+        bool named = true, spoke = true, quiet = true;
+        for (PageVerdict v : all) {
+            const std::string nm = page_verdict_name(v);
+            const std::string tx = page_verdict_text(v);
+            if (nm.empty()) named = false;
+            if (tx.size() < 12) spoke = false;
+            // No URL, no host, no page content ever reaches a verdict string.
+            if (tx.find("http") != std::string::npos ||
+                tx.find("://") != std::string::npos ||
+                tx.find(".com") != std::string::npos) quiet = false;
+        }
+        check(named, "every page verdict has a name");
+        check(spoke, "and an actionable sentence to go with it");
+        check(quiet, "and none of them carries a URL");
+        check(page_verdict_is_clean(PageVerdict::Present) &&
+              page_verdict_is_clean(PageVerdict::Absent) &&
+              page_verdict_is_clean(PageVerdict::NeedleAbsent) &&
+              !page_verdict_is_clean(PageVerdict::Silent) &&
+              !page_verdict_is_clean(PageVerdict::HttpDead),
+              "three verdicts answer the question; the rest are refusals");
+    }
+
+    std::printf("\nwhat a page verdict means to a case\n");
+    {
+        check(page_outcome(PageVerdict::Present).outcome == Outcome::Listed,
+              "a sighting is Listed");
+        check(page_outcome(PageVerdict::Absent).outcome == Outcome::NotFound &&
+              page_outcome(PageVerdict::NeedleAbsent).outcome == Outcome::NotFound,
+              "both absences are NotFound");
+        check(page_outcome(PageVerdict::Present).reason == Reason::None &&
+              page_outcome(PageVerdict::Absent).reason == Reason::None,
+              "a clean fetch carries no reason");
+
+        bool all_indet = true;
+        const PageVerdict refusals[] = {
+            PageVerdict::NoRule, PageVerdict::NoNeedles, PageVerdict::Unfingerprinted,
+            PageVerdict::Ambiguous, PageVerdict::Silent, PageVerdict::Empty,
+            PageVerdict::NoResponse, PageVerdict::HttpDead, PageVerdict::HttpBlocked,
+            PageVerdict::HttpThrottled, PageVerdict::HttpServerError,
+            PageVerdict::HttpUnexpected};
+        for (PageVerdict v : refusals)
+            if (page_outcome(v).outcome != Outcome::Indeterminate) all_indet = false;
+        check(all_indet, "and every refusal is Indeterminate, which never rounds");
+
+        check(page_outcome(PageVerdict::NoRule).reason == Reason::NoRule &&
+              page_outcome(PageVerdict::Silent).reason == Reason::PageUnreadable &&
+              page_outcome(PageVerdict::HttpBlocked).reason == Reason::Blocked &&
+              page_outcome(PageVerdict::HttpDead).reason == Reason::UrlDead,
+              "and the reason says whose bug it is");
+    }
+
+    std::printf("\napplying a page verdict\n");
+    {
+        Case k = mkcase("c-page", "acme");
+        k.consecutive_failures = 2;
+
+        Case blocked = apply_page_verdict(k, PageVerdict::HttpBlocked, "2026-08-17", 45);
+        check(blocked.consecutive_failures == 3,
+              "a broker refusing us is a fact about the broker, and counts");
+        check(blocked.last_attempt == "2026-08-17" && blocked.last_verified.empty(),
+              "a refused check moves the attempt and not the verification");
+
+        Case rotted = apply_page_verdict(k, PageVerdict::Silent, "2026-08-17", 45);
+        check(rotted.consecutive_failures == 2,
+              "a rotted rule is a fact about US, and must not accumulate into a "
+              "case for abandoning the listing");
+        check(rotted.reason == Reason::PageUnreadable, "and it is named as ours");
+        check(rotted.next_check == "2026-10-01",
+              "rescheduled at the normal cadence -- a tunnel may be up tomorrow, "
+              "a rule maintainer will not be");
+
+        Case norule = apply_page_verdict(k, PageVerdict::NoRule, "2026-08-17", 45);
+        check(norule.consecutive_failures == 2 && norule.reason == Reason::NoRule,
+              "a missing rule is the same shape of problem");
+
+        Case seen = apply_page_verdict(k, PageVerdict::Present, "2026-08-17", 45);
+        check(seen.outcome == Outcome::Listed && seen.consecutive_failures == 0 &&
+              seen.clean_absences == 0 && seen.last_verified == "2026-08-17",
+              "a sighting is a clean fetch: streak cleared, absences wiped");
+
+        Case gone = apply_page_verdict(k, PageVerdict::NeedleAbsent, "2026-08-17", 45);
+        check(gone.outcome == Outcome::NotFound && gone.clean_absences == 1,
+              "an absence is a clean fetch too, and starts the streak");
+        check(gone.status == Status::Found,
+              "and does NOT promote -- believing it gone is a separate judgment");
+
+        Case twice = apply_page_verdict(gone, PageVerdict::Absent, "2026-10-01", 45);
+        check(twice.clean_absences == 2 &&
+              promotion_for(twice) == Promotion::Removed,
+              "two clean absences is the pattern the promotion rule waits for");
+    }
+
+    std::printf("\nthe maintenance queue\n");
+    {
+        Caseload c;
+        Case a = mkcase("c-a", "acme");
+        a = apply_page_verdict(a, PageVerdict::NoRule, "2026-08-17", 45);
+        Case b = mkcase("c-b", "acme");
+        b = apply_page_verdict(b, PageVerdict::Ambiguous, "2026-08-17", 45);
+        Case d = mkcase("c-d", "acme");
+        d = apply_page_verdict(d, PageVerdict::HttpBlocked, "2026-08-17", 45);
+        Case e = mkcase("c-e", "acme");
+        e = apply_page_verdict(e, PageVerdict::Absent, "2026-08-17", 45);
+        c = {a, b, d, e};
+
+        const std::vector<const Case*> stuck = caseload_unverifiable(c);
+        check(stuck.size() == 2,
+              "the queue holds the cases WE cannot read, not the ones they refused");
+        check(stuck[0]->id == "c-a" && stuck[1]->id == "c-b",
+              "and names them, so a report can say how many listings it is not "
+              "actually verifying");
+    }
+
+    std::printf("\npage rules pump (round-trip fidelity)\n");
+    {
+        PageRule r;
+        r.broker_id    = "acme";
+        r.fingerprint  = {"acme people search", "acme inc"};
+        r.present      = {"view full report", "background report for"};
+        r.absent       = {"no results found"};
+        r.needs_needle = true;
+        r.reviewed     = "2026-08-01";
+        r.notes        = "shape reference";
+
+        const std::string f = tmp_path("delr_selftest_rules.json");
+        check(rules_save(f, {r}), "rules save");
+        std::string err;
+        const PageRules back = rules_load(f, &err);
+        check(err.empty() && back.size() == 1, "and load, cleanly");
+        if (back.size() == 1) {
+            const PageRule& g = back[0];
+            check(g.broker_id == r.broker_id && g.fingerprint == r.fingerprint &&
+                      g.present == r.present && g.absent == r.absent &&
+                      g.needs_needle == r.needs_needle && g.reviewed == r.reviewed &&
+                      g.notes == r.notes,
+                  "every field survives the round trip -- what you save is what "
+                  "you load");
+        }
+        std::remove(f.c_str());
+
+        std::string err2;
+        check(rules_load(tmp_path("delr_no_such_rules.json"), &err2).empty() &&
+                  err2.empty(),
+              "a missing rules file is a first run, not an error");
+
+        const std::string bad = tmp_path("delr_selftest_rules_bad.json");
+        { std::ofstream o(bad); o << "{ this is not json"; }
+        std::string err3;
+        check(rules_load(bad, &err3).empty() && !err3.empty(),
+              "and malformed JSON reports rather than half-loading");
+        std::remove(bad.c_str());
+    }
+
+
+
+    // ── net/Fetch -- the transport ────────────────────────────────────────
+    // Everything here is hermetic. Not one check below opens a socket: the
+    // url guard is pure, the error vocabulary is a table, the binding is a
+    // projection of a policy, and the two calls that DO reach curl are
+    // arranged to fail before it -- an empty bind address and a bad url both
+    // return before a handle is opened. A selftest that needed the network
+    // would be a selftest that fails on a train.
+    {
+        using namespace delr::net;
+
+        std::printf("\nnet/Fetch -- is this a url we will point a socket at\n");
+        check(fetch_url_ok("https://example.com/listing/7"), "https passes");
+        check(fetch_url_ok("http://example.com"), "so does plain http");
+        check(fetch_url_ok("HTTPS://Example.COM/x"), "the scheme is read case-blind");
+        check(!fetch_url_ok(""), "empty is not a url");
+        check(!fetch_url_ok("example.com"), "and neither is a bare host");
+        check(!fetch_url_ok("file:///etc/passwd"),
+              "file:// is refused -- libcurl speaks twenty protocols and a "
+              "pasted string must not reach nineteen of them");
+        check(!fetch_url_ok("ftp://example.com/x"), "ftp likewise");
+        check(!fetch_url_ok("javascript:alert(1)"), "and a scheme that is not a transport");
+        check(!fetch_url_ok("https://"), "a scheme with no host is not a url");
+        check(!fetch_url_ok("https:///path"), "nor is an empty authority");
+        check(!fetch_url_ok("https://user:pw@example.com/x"),
+              "credentials in a listing url are refused -- a paste accident or "
+              "somebody else's session, and neither goes on a bound handle");
+        check(!fetch_url_ok("https://exa mple.com"), "a space is not part of a host");
+        check(!fetch_url_ok("https://example.com/\x01"), "nor is a control character");
+        check(!fetch_url_ok("https://" + std::string(3000, 'a')), "and there is a length past which we stop");
+
+        std::printf("\nnet/Fetch -- the error vocabulary\n");
+        const FetchError all[] = {
+            FetchError::None, FetchError::NotBuilt, FetchError::BadUrl,
+            FetchError::Refused, FetchError::DnsPinUnavailable,
+            FetchError::BindFailed, FetchError::ProxyFailed, FetchError::Resolve,
+            FetchError::Connect, FetchError::Tls, FetchError::Timeout,
+            FetchError::TooLarge, FetchError::Protocol, FetchError::Other};
+        bool named = true, spoken = true, distinct = true;
+        for (std::size_t i = 0; i < sizeof all / sizeof all[0]; ++i) {
+            const std::string n = fetch_error_name(all[i]);
+            const std::string t = fetch_error_text(all[i]);
+            if (n.empty()) named = false;
+            if (t.size() < 12) spoken = false;
+            for (std::size_t j = 0; j < i; ++j)
+                if (n == fetch_error_name(all[j])) distinct = false;
+        }
+        check(named && distinct, "every error has its own log-safe name");
+        check(spoken, "and a sentence a window can show");
+        check(std::string(fetch_error_name(FetchError::None)) == "ok",
+              "none is spelled ok in a log line");
+
+        std::printf("\nnet/Fetch -- whose problem is it\n");
+        check(fetch_error_is_ours(FetchError::Refused),
+              "a refusal is ours: the policy said no, which says nothing "
+              "about the listing");
+        check(fetch_error_is_ours(FetchError::BindFailed),
+              "a failed bind is ours: the killswitch fired");
+        check(fetch_error_is_ours(FetchError::ProxyFailed),
+              "a proxy that would not take the connection is ours");
+        check(fetch_error_is_ours(FetchError::DnsPinUnavailable),
+              "a libcurl that cannot pin is ours");
+        check(fetch_error_is_ours(FetchError::NotBuilt),
+              "a build with no transport in it is ours");
+        check(!fetch_error_is_ours(FetchError::Timeout) &&
+              !fetch_error_is_ours(FetchError::Connect) &&
+              !fetch_error_is_ours(FetchError::Tls) &&
+              !fetch_error_is_ours(FetchError::Resolve),
+              "a timeout, a refused connection, a bad certificate and a name "
+              "that will not resolve are NOT claimed as ours -- they are "
+              "indistinguishable from a broker that is slow or blocking, and "
+              "the honest reading of 'cannot tell' does not forgive the site");
+        check(!fetch_error_is_ours(FetchError::TooLarge) &&
+              !fetch_error_is_ours(FetchError::Protocol) &&
+              !fetch_error_is_ours(FetchError::Other),
+              "nor is an oversized page, an unreadable reply, or an "
+              "unclassified failure");
+        check(!fetch_error_is_ours(FetchError::BadUrl),
+              "a url that will not parse is not an outage: retrying it "
+              "tomorrow would be a lie about what needs fixing");
+        check(!fetch_error_is_ours(FetchError::None),
+              "and a successful fetch is nobody's problem");
+
+        // The composition the check button makes: an OURS failure takes the
+        // egress path, which leaves the failure streak where it was. Asserted
+        // here rather than trusted, because the two halves live in different
+        // libraries and nothing else pairs them.
+        {
+            Case k = mkcase("ours-1", "alpha");
+            k.consecutive_failures = 2;
+            k.last_verified = "2026-02-01";
+            const Case after = apply_egress_refusal(k, "2026-03-01");
+            check(after.outcome == Outcome::Indeterminate &&
+                  after.reason == Reason::NoTunnel,
+                  "our own failure records indeterminate/no-tunnel");
+            check(after.consecutive_failures == 2,
+                  "and does not touch the streak, so an expired subscription "
+                  "cannot argue a case toward abandoned");
+            check(after.next_check == "2026-03-02",
+                  "and comes back tomorrow rather than in 45 days");
+        }
+
+        std::printf("\nnet/Fetch -- how the handle is tied to the tunnel\n");
+        {
+            EgressPolicy p = mkpolicy();          // Proxied, with a socks5h proxy
+            EgressObservation o = mkobs();
+            FetchBinding b = fetch_binding_from(p, o);
+            check(b.bind_address == o.bound_address,
+                  "the bind address is the one the observer reported, not the "
+                  "interface name and not the policy's idea of it");
+            check(b.proxy == p.proxy && b.dns_servers.empty(),
+                  "proxied sends the proxy and pins no resolver");
+
+            p.dns = DnsMode::Pinned;
+            p.resolver = "10.7.0.1";
+            p.proxy.clear();
+            b = fetch_binding_from(p, o);
+            check(b.dns_servers == "10.7.0.1" && b.proxy.empty(),
+                  "and pinned does the opposite");
+
+            p.dns = DnsMode::Unset;
+            b = fetch_binding_from(p, o);
+            check(b.proxy.empty() && b.dns_servers.empty(),
+                  "an undecided policy configures neither -- the refusal comes "
+                  "from egress_check, not from a half-built handle");
+        }
+
+        std::printf("\nnet/Fetch -- the gate is the function\n");
+        {
+            FetchRequest req;
+            req.url = "https://example.com/listing/7";
+
+            EgressPolicy p = mkpolicy();
+            EgressObservation o;                  // default: nothing observed
+            FetchResult r = fetch(req, p, o, 1000);
+            check(r.error == FetchError::Refused,
+                  "an empty observation refuses the fetch rather than trying it");
+            check(r.verdict == Verdict::NoInterface,
+                  "and carries the verdict, so the caller need not re-run the check");
+            check(r.body.empty() && r.status == 0,
+                  "a refusal produces no status and no body -- nothing happened");
+
+            EgressPolicy bad;                     // unconfigured
+            r = fetch(req, bad, mkobs(), 1000);
+            check(r.error == FetchError::Refused && r.verdict == Verdict::Unconfigured,
+                  "a policy problem refuses before any observation is consulted");
+
+            p.dns = DnsMode::Proxied;
+            p.proxy = "socks5://127.0.0.1:1080";   // the missing 'h'
+            r = fetch(req, p, mkobs(), 1000);
+            check(r.error == FetchError::Refused && r.verdict == Verdict::ProxyMissing,
+                  "a socks5 proxy without the 'h' never reaches a socket -- it "
+                  "would resolve the roster here and send it clean");
+
+            req.url = "file:///etc/passwd";
+            r = fetch(req, mkpolicy(), mkobs(), 1000);
+            check(r.error == FetchError::Refused || r.error == FetchError::BadUrl,
+                  "and a url we will not touch is refused either way");
+        }
+
+        std::printf("\nnet/Fetch -- there is no unbound path through the file\n");
+        {
+            FetchRequest req;
+            req.url = "https://example.com/";
+            FetchBinding nowhere;                  // no address
+            const FetchResult r = fetch_unchecked(req, nowhere);
+            check(r.error == FetchError::BindFailed || r.error == FetchError::NotBuilt,
+                  "even the preflight's own call refuses without an address to "
+                  "bind to -- the killswitch holds inside the preflight");
+
+            FetchBinding b;
+            b.bind_address = "127.0.0.1";
+            req.url = "ftp://example.com/x";
+            const FetchResult r2 = fetch_unchecked(req, b);
+            check(r2.error == FetchError::BadUrl || r2.error == FetchError::NotBuilt,
+                  "and the url guard runs before the handle is opened");
+        }
+
+        std::printf("\nnet/Observer -- the readings, without the network\n");
+        {
+            check(iface_read("").present == false,
+                  "an unnamed interface reads as absent, not as an error");
+            check(iface_read("delr_no_such_iface0").present == false,
+                  "so does one that is not there");
+
+            const IfaceReading lo = iface_read("lo");
+            check(lo.present && lo.up && !lo.addresses.empty(),
+                  "loopback is present, up, and has an address -- the one "
+                  "interface every machine running this test has");
+
+            check(bind_probe("").empty(), "no address, no bind");
+            check(bind_probe("not-an-address").empty(), "nor from something unreadable");
+            check(bind_probe("127.0.0.1") == "127.0.0.1",
+                  "binding to loopback reports back what the kernel gave us");
+            check(bind_probe("203.0.113.9").empty(),
+                  "and binding to an address this machine does not have fails, "
+                  "which is exactly what a dropped tunnel looks like");
+
+            const auto names = iface_list();
+            check(std::find(names.begin(), names.end(), "lo") != names.end(),
+                  "the interface list finds loopback");
+            check(std::adjacent_find(names.begin(), names.end()) == names.end(),
+                  "and lists each interface once, however many families it has "
+                  "-- a settings window showing 'lo, lo, eth0' is a settings "
+                  "window nobody trusts");
+
+            // The baseline is the one deliberately naked request in the
+            // program, so its refusals are worth pinning down. All of these
+            // return before a socket exists; nothing here opens one.
+            // An ObserverConfig is built from the policy now, and a policy is
+            // where the endpoints live. Built by hand it is EMPTY, which is the
+            // direction everything in this subsystem fails in.
+            check(ObserverConfig{}.echo_url.empty() && ObserverConfig{}.canary_url.empty(),
+                  "an observer config built from nothing asks nothing");
+            {
+                EgressPolicy ep = mkpolicy();
+                const ObserverConfig from_policy = observer_config(ep);
+                check(from_policy.echo_url == ep.echo_url &&
+                          from_policy.canary_url == ep.canary_url,
+                      "and one built from a policy carries BOTH endpoints -- the "
+                      "failure this exists to prevent is a caller that copies the "
+                      "echo, forgets the canary, and turns the lookup check off "
+                      "in one window and not the others");
+            }
+
+            ObserverConfig quiet = observer_config(mkpolicy());
+            check(baseline_read("delr_no_such_iface0", quiet).address.empty(),
+                  "no baseline from an interface that is not there");
+            check(baseline_read("delr_no_such_iface0", quiet).resolver.empty(),
+                  "and no resolver baseline either -- both halves ride the one "
+                  "naked request and neither happens without an interface");
+            check(!baseline_read("delr_no_such_iface0", quiet).notes.empty(),
+                  "and it says so, in a sentence carrying no address");
+
+            ObserverConfig nothing;   // both endpoints empty
+            const BaselineResult none = baseline_read("lo", nothing);
+            check(none.address.empty() && none.resolver.empty(),
+                  "and none of either with nothing to ask");
+            check(!none.notes.empty(), "which is said rather than returned silently");
+
+            std::string text;
+            check(routes_read(&text, tmp_path("delr_no_such_routes")) ==
+                      ProbeReadings::RouteSource::Absent,
+                  "a missing routing table is a kernel without v6, not a failure");
+
+            const std::string rf = tmp_path("delr_selftest_routes");
+            { std::ofstream o(rf); o << "00000000000000000000000000000000 00 "
+                                        "00000000000000000000000000000000 00 "
+                                        "00000000000000000000000000000000 "
+                                        "00000400 00000000 00000000 00000003 wg0\n"; }
+            text.clear();
+            check(routes_read(&text, rf) == ProbeReadings::RouteSource::Text &&
+                      !text.empty(),
+                  "and a readable one comes back verbatim, for the core to judge");
+            std::remove(rf.c_str());
+        }
     }
 
     std::printf("\n%d pass / %d fail\n", g_pass, g_fail);

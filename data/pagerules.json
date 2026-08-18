@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "_comment": "Page rules -- what a fetched page has to say for a listing to count as gone. Separate file from brokers.json on purpose: this one rots on a designer's schedule, not a company's, and bundling them would bump the roster's version every time a broker A/B tests a footer. Every rule needs a fingerprint (is this the broker's page at all), a present list and an absent list. Re-read them against the live page and bump 'reviewed'. A broker with NO rule here is a normal state -- it means its listings can be fetched but not read, and the app says so rather than guessing.",
+  "rules": [
+    {
+      "broker_id": "example-web",
+      "fingerprint": [
+        "example people search"
+      ],
+      "present": [
+        "view full report",
+        "background report for"
+      ],
+      "absent": [
+        "no results found",
+        "we could not find anyone matching",
+        "this profile is no longer available"
+      ],
+      "needs_needle": true,
+      "reviewed": "2026-08-17",
+      "notes": "Placeholder. Shape reference only -- not a real broker. Note the fingerprint is ONE stable string from the site chrome, not a list of five: every entry is another thing that can rot, and a rotted fingerprint refuses every check on this broker. needs_needle is on because listing pages here are per-person, so a presence marker without the person's own details is the template rather than the listing."
+    },
+    {
+      "broker_id": "example-mail",
+      "fingerprint": [
+        "example data co"
+      ],
+      "present": [
+        "record on file"
+      ],
+      "absent": [
+        "no matching record",
+        "this record has been deleted"
+      ],
+      "needs_needle": false,
+      "reviewed": "",
+      "notes": "Placeholder. Deliberately left unreviewed so the stale-rule path has something to demonstrate: this rule still produces verdicts, but the report is entitled to say nobody has checked it against the live page."
+    }
+  ]
+}

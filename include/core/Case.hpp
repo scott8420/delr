@@ -74,7 +74,14 @@ enum class Reason {
     RateLimited,
     Timeout,
     BadResponse,   // 5xx, truncated, unparseable
-    UrlDead        // 404 on the URL itself: gone, or moved. Ambiguous by nature.
+    UrlDead,       // 404 on the URL itself: gone, or moved. Ambiguous by nature.
+
+    // The two below are OUR bugs, not theirs, and that is the whole reason
+    // they are separate values: a maintainer fixes these, a retry does not.
+    // See core/PageRules -- neither one bumps the failure streak, because a
+    // rule we cannot read with is not evidence about the listing.
+    NoRule,        // no page rule for this broker: fetchable, unreadable
+    PageUnreadable // a rule exists and did not fit the page it was given
 };
 
 // ── What this listing exposes ────────────────────────────────────────────────

@@ -8,6 +8,7 @@
 #include "selftest.hpp"
 #include "core/Broker.hpp"
 #include "core/Case.hpp"
+#include "core/Intake.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -352,6 +353,255 @@ int run() {
     check(cerr2.empty(), "an absent caseload file is not an error");
 
     std::remove(cf.c_str());
+
+    // ── Intake: the paste-a-URL path ─────────────────────────────────────────
+    // Everything between a pasted URL and a row in the caseload is decided
+    // here, headless. The dialog only shows what these functions concluded, so
+    // this is where the feature is actually tested.
+    std::printf("\nurl checking\n");
+    check(url_check("") == UrlProblem::Empty, "an empty paste is Empty, not an error");
+    check(url_check("   \n") == UrlProblem::Empty, "whitespace only is Empty");
+    check(url_check("https://spokeo.example/John-Smith") == UrlProblem::None,
+          "a full https URL passes");
+    check(url_check("spokeo.example/John-Smith") == UrlProblem::None,
+          "a scheme-less paste passes -- people type the host, not the scheme");
+    check(url_check("http://spokeo.example/x") == UrlProblem::None, "http passes");
+    check(url_check("  https://spokeo.example/x  ") == UrlProblem::None,
+          "surrounding whitespace is trimmed, not refused");
+    check(url_check("https://spokeo.example/a b") == UrlProblem::Whitespace,
+          "an embedded space is Whitespace -- two URLs pasted at once");
+    check(url_check("file:///etc/passwd") == UrlProblem::BadScheme, "file: is refused");
+    check(url_check("javascript:alert(1)") == UrlProblem::BadScheme,
+          "javascript: is refused");
+    check(url_check("mailto:privacy@spokeo.example") == UrlProblem::BadScheme,
+          "mailto: is refused");
+    check(url_check("https://") == UrlProblem::NoHost, "a scheme with no host is NoHost");
+    check(url_check("https:spokeo.example/x") == UrlProblem::NoHost,
+          "a scheme without // is a typo, not a guess");
+    check(url_check("https://localhost/x") == UrlProblem::BadHost,
+          "a dotless host is refused -- a listing lives on the public web");
+    check(url_check("https://spokeo..example/x") == UrlProblem::BadHost,
+          "a doubled dot is refused");
+    check(url_check("https://spokeo.example:80x/x") == UrlProblem::BadHost,
+          "a non-numeric port is refused");
+    check(url_check("https://user@spokeo.example/x") == UrlProblem::HasUserinfo,
+          "userinfo is refused rather than silently stripped");
+    for (auto p : {UrlProblem::None, UrlProblem::Empty, UrlProblem::Whitespace,
+                   UrlProblem::BadScheme, UrlProblem::NoHost, UrlProblem::BadHost,
+                   UrlProblem::HasUserinfo})
+        check(std::string(url_problem_name(p)) != "", "every url problem has a name");
+    check(std::string(url_problem_text(UrlProblem::None)).empty(),
+          "a clean URL has no complaint to show");
+    check(std::string(url_problem_text(UrlProblem::BadScheme)).find("http") !=
+          std::string::npos, "the bad-scheme message says what IS accepted");
+
+    std::printf("\nurl normalising\n");
+    check(url_normalize("spokeo.example/John-Smith") == "https://spokeo.example/John-Smith",
+          "a scheme-less paste normalises to https");
+    check(url_normalize("http://spokeo.example/x") == "http://spokeo.example/x",
+          "an explicit http is never upgraded away -- we do not guess at where a request goes");
+    check(url_normalize("HTTPS://Spokeo.Example/John-Smith") ==
+          "https://spokeo.example/John-Smith",
+          "scheme and host lower-case, path does not");
+    check(url_normalize("https://spokeo.example/John-Smith#relatives") ==
+          "https://spokeo.example/John-Smith",
+          "the fragment is dropped -- it never reaches the server");
+    check(url_normalize("https://spokeo.example/") == "https://spokeo.example",
+          "a bare trailing slash is dropped");
+    check(url_normalize("https://spokeo.example/p/?id=7&x=Y") ==
+          "https://spokeo.example/p/?id=7&x=Y",
+          "the query survives byte-for-byte -- broker ids live in it");
+    check(url_normalize("https://spokeo.example:8443/x") == "https://spokeo.example:8443/x",
+          "a non-default port is part of where the request goes");
+    check(url_normalize("https://www.spokeo.example/x") == "https://www.spokeo.example/x",
+          "www. is kept in the stored URL -- the stored URL has to fetch");
+    check(url_normalize("file:///etc/passwd").empty(),
+          "a URL that fails checking normalises to empty, never to a guess");
+
+    std::printf("\nurl host\n");
+    check(url_host("https://www.Spokeo.example/John-Smith") == "spokeo.example",
+          "the display host drops www. and lower-cases");
+    check(url_host("https://spokeo.example:8443/x") == "spokeo.example",
+          "the display host drops the port");
+    check(url_host("spokeo.example/x") == "spokeo.example",
+          "the display host works on a scheme-less paste");
+    check(url_host("").empty(), "no host in an empty string");
+    check(url_host("https://spokeo.example/John-Smith/Tennessee").find('/') ==
+          std::string::npos,
+          "the host NEVER carries the path -- the path is the part with the name in it");
+
+    std::printf("\nbroker matching\n");
+    {
+        Roster r;
+        r.push_back(mk("spokeo", Method::Web));
+        r.push_back(mk("radaris", Method::Email));
+        Broker sub;                       // a sub-brand under a longer host
+        sub.id = "spokeo-uk"; sub.name = "Spokeo UK";
+        sub.site = "https://uk.spokeo.example"; sub.method = Method::Web;
+        r.push_back(sub);
+        Broker owner;                     // matched only by its opt-out URL
+        owner.id = "peoplefind"; owner.name = "PeopleFind";
+        owner.site = "https://corp.example"; owner.method = Method::Web;
+        owner.opt_out_url = "https://peoplefind.example/optout";
+        r.push_back(owner);
+
+        const Broker* b = broker_for_url(r, "https://spokeo.example/John-Smith");
+        check(b && b->id == "spokeo", "an exact host match finds the broker");
+        b = broker_for_url(r, "https://www.spokeo.example/John-Smith");
+        check(b && b->id == "spokeo", "www. matches the bare host");
+        b = broker_for_url(r, "https://search.spokeo.example/x");
+        check(b && b->id == "spokeo", "an unknown subdomain matches the parent");
+        b = broker_for_url(r, "https://uk.spokeo.example/x");
+        check(b && b->id == "spokeo-uk",
+              "an exact match on a sub-brand beats a subdomain match on its parent");
+        b = broker_for_url(r, "https://peoplefind.example/listing/7");
+        check(b && b->id == "peoplefind", "the opt-out URL's host matches too");
+        check(broker_for_url(r, "https://notspokeo.example/x") == nullptr,
+              "a host that merely ENDS with a broker host does not match");
+        check(broker_for_url(r, "https://unknown.example/x") == nullptr,
+              "an unknown host is nullptr -- a normal answer, not an error");
+        check(broker_for_url(r, "not a url") == nullptr, "a bad URL matches nothing");
+    }
+
+    std::printf("\ncase ids\n");
+    {
+        Caseload c;
+        check(next_case_id(c, "spokeo", "2026-08-17") == "spokeo-20260817",
+              "the first id of the day is broker + date");
+        Case a = mkcase("spokeo-20260817", "spokeo");
+        c.push_back(a);
+        check(next_case_id(c, "spokeo", "2026-08-17") == "spokeo-20260817-2",
+              "a taken id bumps a counter");
+        Case b2 = mkcase("spokeo-20260817-2", "spokeo");
+        c.push_back(b2);
+        check(next_case_id(c, "spokeo", "2026-08-17") == "spokeo-20260817-3",
+              "and keeps bumping");
+        check(next_case_id(c, "Weird Broker!", "2026-08-17") == "weird-broker-20260817",
+              "a broker id with junk in it is slugged, never passed through");
+        check(next_case_id(c, "spokeo", "2026-08-17").find("John") == std::string::npos,
+              "an id is minted from the broker and the date -- never from the URL");
+    }
+
+    std::printf("\nintake\n");
+    {
+        Roster r;
+        r.push_back(mk("spokeo", Method::Web));
+        Caseload c;
+
+        IntakeReport rep = intake_inspect(r, c, "spokeo.example/John-Smith");
+        check(rep.problem == UrlProblem::None, "a good paste has no problem");
+        check(rep.ready(), "a good paste on a known host is ready to commit");
+        check(rep.broker && rep.broker->id == "spokeo", "the report names the broker");
+        check(rep.host == "spokeo.example", "the report carries the display host");
+        check(rep.normalized == "https://spokeo.example/John-Smith",
+              "the report carries the URL as it would be stored");
+        check(!rep.duplicate() && !rep.relist, "nothing to collide with yet");
+
+        IntakeReport unknown = intake_inspect(r, c, "https://elsewhere.example/x");
+        check(!unknown.ready(), "an unmatched host is not ready -- the user must name the broker");
+        check(unknown.problem == UrlProblem::None,
+              "an unmatched host is not a URL problem; the URL is fine");
+
+        Case k = intake_new_case(rep, c, "2026-08-17", {Field::Name, Field::Phone}, "found via search");
+        check(k.id == "spokeo-20260817", "the new case carries a minted id");
+        check(k.broker_id == "spokeo", "the new case is filed under the matched broker");
+        check(k.url == rep.normalized, "the new case stores the normalised URL");
+        check(k.status == Status::Found, "a pasted listing starts at Found");
+        check(k.outcome == Outcome::Never,
+              "outcome stays Never -- the user looked, WE have not fetched");
+        check(k.provenance == Provenance::None, "nobody has claimed anything yet");
+        check(k.first_seen == "2026-08-17", "first_seen is the day the user found it");
+        check(k.next_check == "2026-08-17", "never verified, so it is due now");
+        check(k.exposes.size() == 2, "the observed fields ride along");
+        check(k.consecutive_failures == 0, "a fresh case has no failures");
+
+        check(caseload_commit(c, k), "committing a good case succeeds");
+        check(c.size() == 1, "the caseload grew by one");
+        check(caseload_validate(c).empty(), "a case built by intake validates");
+        check(log_ref(k).find("John") == std::string::npos,
+              "the new case's log_ref carries no URL");
+
+        check(!caseload_commit(c, k), "committing the same id twice is refused");
+        check(c.size() == 1, "a refused commit changes nothing");
+
+        // The duplicate paths.
+        IntakeReport dup = intake_inspect(r, c, "https://spokeo.example/John-Smith");
+        check(dup.duplicate(), "pasting a tracked listing again is a duplicate");
+        check(!dup.ready(), "a duplicate is not ready to commit");
+        check(dup.existing && dup.existing->id == "spokeo-20260817",
+              "the report names the case already holding it");
+        IntakeReport dup2 = intake_inspect(r, c, "http://WWW.Spokeo.example/John-Smith/");
+        check(dup2.duplicate(),
+              "the same listing pasted with www, http and a trailing slash is still a duplicate");
+        IntakeReport other = intake_inspect(r, c, "https://spokeo.example/John-Smith-2");
+        check(!other.duplicate(),
+              "a different listing on the same broker is a different case -- a case is one LISTING");
+        check(other.ready(), "and it is ready to commit");
+
+        // The relist path: the record we believed was gone is back.
+        c[0].status        = Status::Removed;
+        c[0].provenance    = Provenance::SelfVerified;
+        c[0].last_verified = "2026-08-17";
+        c[0].last_attempt  = "2026-08-17";
+        c[0].outcome       = Outcome::NotFound;
+        check(caseload_validate(c).empty(), "the removed case is well-formed to start from");
+
+        IntakeReport re = intake_inspect(r, c, "https://spokeo.example/John-Smith");
+        check(re.relist, "pasting a REMOVED listing again is a relist, not a duplicate");
+        check(!re.duplicate(), "and a relist is not blocked as a duplicate");
+        check(re.ready(), "a relist is ready to commit");
+
+        Case succ = intake_relist_case(re, c, "2026-08-17");
+        check(succ.supersedes == "spokeo-20260817", "the successor names its predecessor");
+        check(succ.id != succ.supersedes, "the successor is a NEW case, not an edit");
+        check(succ.status == Status::Found, "the successor starts at Found");
+        check(succ.provenance == Provenance::None,
+              "the old proof does not transfer -- it was disproved by the relist");
+        check(succ.outcome == Outcome::Listed, "we are here because the record was seen again");
+        check(succ.next_check == "2026-08-17", "the successor comes due now, not on the old schedule");
+        check(succ.exposes == c[0].exposes, "the old exposure list is a starting assumption");
+
+        check(caseload_commit(c, succ), "committing the successor succeeds");
+        check(c.size() == 2, "the caseload grew by one");
+        check(c[0].status == Status::Relisted,
+              "the predecessor is ended at Relisted in the SAME call -- both facts, both kept");
+        check(caseload_validate(c).empty(), "the caseload validates after a relist");
+
+        IntakeReport after = intake_inspect(r, c, "https://spokeo.example/John-Smith");
+        check(after.existing && after.existing->id == succ.id,
+              "the URL now resolves to the successor, not the ended case");
+
+        // A commit that names a predecessor we don't have must change nothing.
+        Case orphan = mkcase("orphan-1", "spokeo");
+        orphan.supersedes = "no-such-case";
+        const std::size_t before = c.size();
+        check(!caseload_commit(c, orphan), "a successor to an unknown case is refused");
+        check(c.size() == before, "and the caseload is untouched");
+
+        Case nameless = mkcase("", "spokeo");
+        check(!caseload_commit(c, nameless), "a case with no id is refused");
+    }
+
+    std::printf("\nintake survives the pump\n");
+    {
+        Roster r;
+        r.push_back(mk("spokeo", Method::Web));
+        Caseload c;
+        IntakeReport rep = intake_inspect(r, c, "spokeo.example/p/?id=7&x=Y#frag");
+        Case k = intake_new_case(rep, c, "2026-08-17", {Field::Phone}, "a note");
+        check(caseload_commit(c, k), "committed");
+
+        const std::string f = tmp_path("delr_intake_cases.json");
+        check(caseload_save(f, c), "an intake-built caseload saves");
+        std::string err;
+        Caseload back = caseload_load(f, &err);
+        check(err.empty() && back.size() == 1, "and loads back");
+        check(back[0].url == k.url, "the URL survives the round trip, query and all");
+        check(back[0].next_check == k.next_check, "the schedule survives");
+        check(back[0].exposes == k.exposes, "the exposure list survives");
+        check(caseload_validate(back).empty(), "and the reloaded caseload validates");
+        std::remove(f.c_str());
+    }
 
     std::printf("\n%d pass / %d fail\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

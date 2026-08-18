@@ -7,6 +7,7 @@
 #include <glibmm/datetime.h>
 #include <gtkmm/label.h>
 #include <cstdlib>
+#include <filesystem>
 
 namespace delr {
 
@@ -77,11 +78,10 @@ std::string Shell::case_row_text(const core::Case& k) const {
     const auto* b = core::roster_find(m_roster, k.broker_id);
     std::string who = b ? b->name : k.broker_id;
 
-    std::string host = k.url;
-    const auto scheme = host.find("://");
-    if (scheme != std::string::npos) host = host.substr(scheme + 3);
-    const auto slash = host.find('/');
-    if (slash != std::string::npos) host = host.substr(0, slash);
+    // The host comes from core::url_host now that the intake path needs the
+    // same answer -- one parser, so the row and the matcher can never disagree
+    // about what site a listing is on.
+    const std::string host = core::url_host(k.url);
 
     std::string line = who + "   [" + core::status_name(k.status) + "]";
 
@@ -147,9 +147,10 @@ void Shell::on_reload_cases() {
         // to apologise for.
         m_cases_status.set_text("No cases yet.");
         m_cases_exposure.set_text(
-            "Find your own listing in your own browser, then add its URL here. "
-            "delr does not search brokers for you -- querying them with your "
-            "name is a signal to them, not an observation of them.");
+            "Find your own listing in your own browser, then add its URL with + "
+            "in the title bar (Ctrl+N). delr does not search brokers for you -- "
+            "querying them with your name is a signal to them, not an "
+            "observation of them.");
         return;
     }
 
@@ -184,6 +185,56 @@ void Shell::on_reload_cases() {
         }
         m_cases_exposure.set_text(line);
     }
+}
+
+// ── Intake ───────────────────────────────────────────────────────────────────
+
+void Shell::on_add_case() {
+    // Both tables go in by value; the dialog works from a snapshot and hands
+    // back a case. It never touches the file.
+    m_add_dialog.open(*this, m_roster, m_caseload, today());
+}
+
+void Shell::on_case_committed(core::Case fresh) {
+    auto lg = log::get(log::Area::Cases);
+
+    // The dialog minted the id against the snapshot it was given. The live
+    // caseload is the authority, and it may have moved underneath -- a reload
+    // while the dialog was open, a second window later. Re-mint on collision
+    // rather than refusing the user's work.
+    if (core::caseload_find(m_caseload, fresh.id)) {
+        const std::string was = fresh.id;
+        fresh.id = core::next_case_id(m_caseload, fresh.broker_id, today());
+        if (lg) lg->warn("intake: id {} was taken, minted {}", was, fresh.id);
+    }
+
+    if (!core::caseload_commit(m_caseload, fresh)) {
+        if (lg) lg->error("intake: commit refused for {}", core::log_ref(fresh));
+        m_cases_status.set_text("Could not add that case -- see the log.");
+        return;
+    }
+
+    // The caseload's directory may not exist yet (DELR_CASES can point
+    // anywhere). Creating it is path work, so it is UI-side, like resolving it.
+    const std::string file = cases_file();
+    std::error_code ec;
+    std::filesystem::create_directories(Glib::path_get_dirname(file), ec);
+
+    if (!core::caseload_save(file, m_caseload)) {
+        // The case is in memory but not on disk. Say so plainly: a silent
+        // failure here loses the one thing the user just did by hand.
+        if (lg) lg->error("intake: save failed");
+        m_cases_status.set_text("Added, but the caseload could not be saved -- see the log.");
+        return;
+    }
+    if (lg) lg->info("intake: committed {}, caseload now {} case(s)",
+                     core::log_ref(fresh), m_caseload.size());
+
+    // Repaint FROM DISK rather than from memory: the reload proves the write
+    // round-tripped, and the trace and the window then agree by construction
+    // instead of by assumption.
+    on_reload_cases();
+    m_stack.set_visible_child(m_cases_page);
 }
 
 void Shell::on_dump_registry() { registry::dump(); }

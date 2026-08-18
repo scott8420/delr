@@ -1,7 +1,9 @@
 #pragma once
+#include "AddCaseDialog.hpp"
 #include "widgets/Widgets.hpp"
 #include "core/Broker.hpp"
 #include "core/Case.hpp"
+#include "core/Intake.hpp"
 
 #include <gtkmm/applicationwindow.h>
 #include <giomm/menu.h>
@@ -51,6 +53,8 @@ private:
     void bind_actions();                      // category: bindings: actions
 
     // ── handlers ───────────────────────────────────────────────────────────
+    void on_add_case();                       // category: handler: open the paste-a-URL dialog
+    void on_case_committed(core::Case fresh);  // category: handler: commit + save + repaint
     void on_reload_roster();                  // category: handler: re-read the roster from disk
     void on_reload_cases();                   // category: handler: re-read the caseload from disk
     void on_dump_registry();                  // category: handler: print the live widget tree
@@ -72,7 +76,13 @@ private:
     std::string case_row_text(const core::Case& k) const;
 
     // Titlebar.
+    widgets::Button     m_add_button;
     widgets::MenuButton m_menu_button;
+
+    // The paste-a-URL surface. A MEMBER, built once and hidden on close rather
+    // than constructed per use (the Cairn lifetime pattern) -- see its header
+    // for why hiding also clears.
+    AddCaseDialog m_add_dialog;
 
     // Body: sidebar | stack (each surface is a stack page).
     widgets::Box          m_body;

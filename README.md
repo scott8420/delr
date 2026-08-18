@@ -57,10 +57,12 @@ Stub. What exists and is exercised:
 |---|---|---|
 | Broker roster + JSON pump + validation | `include/core/Broker.hpp`, `src/core/Broker.cpp` | exercised |
 | Caseload: status/outcome/provenance, dates, scheduling, exposure roll-up | `include/core/Case.hpp`, `src/core/Case.cpp` | exercised |
+| Intake: URL parse, broker match by host, id minting, duplicate + relist detection | `include/core/Intake.hpp`, `src/core/Intake.cpp` | exercised |
 | Follows the desktop light/dark preference | `include/Appearance.hpp`, `src/Appearance.cpp` | working |
-| Core checks (`delr --selftest`) | `src/selftest.cpp` | 120 pass / 0 fail, run on demand |
+| Core checks (`delr --selftest`) | `src/selftest.cpp` | 228 pass / 0 fail, run on demand |
 | App shell, sidebar + stack, roster page | `src/Shell*.cpp` | compiles; **unverified visually** |
 | Cases page: status line, exposure roll-up, case list | `src/Shell_zones.cpp`, `src/Shell_handlers.cpp` | compiles; **unverified visually** |
+| Add a case: paste a URL, pick the broker, tick what it exposes | `include/AddCaseDialog.hpp`, `src/AddCaseDialog.cpp` | compiles; **unverified visually** |
 
 The GUI has been compiled but never *seen* — there's no display in the
 environment it was built in. Compiling is one channel of evidence; eyes are the
@@ -68,7 +70,7 @@ other, and only the case where both agree counts as working.
 
 ## Next
 
-Adding a case from the UI (paste a URL) · egress policy (bind first, preflight, fail
+Egress policy (`core/Egress`: bind first, preflight, fail
 closed) · the verification fetch itself · roster fetched from a hosted repo with
 a baked-in fallback · profile storage, encrypted at rest.
 

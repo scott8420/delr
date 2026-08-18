@@ -11,8 +11,14 @@ void Shell::build_shell() {
     set_default_size(900, 600);
 
     auto* header = Gtk::make_managed<Gtk::HeaderBar>();
+    // Adding a case is the app's one creating action, so it gets the one
+    // always-visible button. Everything else lives behind the hamburger.
+    m_add_button.set_icon_name("list-add-symbolic");
+    m_add_button.set_tooltip_text("Add a case from a listing URL (Ctrl+N)");
+    m_add_button.set_action_name("win.add-case");
     m_menu_button.set_icon_name("open-menu-symbolic");
     m_menu_button.set_menu_model(build_menu());
+    header->pack_start(m_add_button);
     header->pack_end(m_menu_button);
     set_titlebar(*header);
 
@@ -60,6 +66,7 @@ void Shell::build_pages() {
 
 Glib::RefPtr<Gio::Menu> Shell::build_menu() {
     auto menu = Gio::Menu::create();
+    menu->append("Add case...",   "win.add-case");
     menu->append("Reload roster", "win.reload-roster");
     menu->append("Reload cases",  "win.reload-cases");
     menu->append("Dump registry", "win.dump-registry");

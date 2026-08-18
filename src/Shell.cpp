@@ -7,7 +7,8 @@
 namespace delr {
 
 Shell::Shell()
-    : m_menu_button("shell.menu"),
+    : m_add_button("shell.add", "Add case"),
+      m_menu_button("shell.menu"),
       m_body("shell.body", Gtk::Orientation::HORIZONTAL),
       m_sidebar("shell.sidebar"),
       m_stack("shell.pages"),
@@ -23,7 +24,10 @@ Shell::Shell()
     set_name("shell");
 }
 
-Shell::~Shell() = default;
+// The dialog is a member and outlives nothing: if it is still on screen when
+// the main window goes away, hide it first rather than destroying a visible
+// top-level.
+Shell::~Shell() { m_add_dialog.set_visible(false); }
 
 // The ordered pass: construct -> name/register (done by Named<W> in the ctor)
 // -> bind. Nothing here does real work; each step delegates to its category.

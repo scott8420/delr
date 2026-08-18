@@ -18,6 +18,10 @@ add_library(delr_core STATIC
     src/core/Broker.cpp
     # Table two: the caseload. PII, unlike the roster -- see the header.
     src/core/Case.cpp
+    # The paste-a-URL path: parse, match, mint, commit. Everything between a
+    # pasted URL and a row in the caseload that can be decided without a
+    # display -- which is all of it.
+    src/core/Intake.cpp
 )
 target_include_directories(delr_core PUBLIC include)
 # Vendored nlohmann/json (header-only, MIT), PRIVATE -- an implementation
@@ -42,6 +46,10 @@ if(GTKMM_FOUND AND spdlog_FOUND)
         # and GSettings calls are GIO, which gtkmm-4.0 already brings in.
         src/Appearance.cpp
         src/Shell.cpp
+        # The paste-a-URL dialog. A window of its own rather than a fifth Shell
+        # category: it has its own lifetime (hide on close) and its own state,
+        # and the Shell's split is by category of code, not by feature.
+        src/AddCaseDialog.cpp
         src/Shell_zones.cpp
         src/Shell_bindings.cpp
         src/Shell_handlers.cpp

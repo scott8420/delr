@@ -267,6 +267,10 @@ Case apply_check(const Case& c, Outcome o, Reason r,
 
     if (o == Outcome::Indeterminate) {
         ++n.consecutive_failures;
+        // The absence streak is NOT broken. A check we could not run is not a
+        // sighting; absence of evidence is not evidence of presence, and
+        // resetting here would mean one blocked fetch erases a clean absence we
+        // did observe. It does not advance either -- only a clean look counts.
         // Still scheduled. A check we could not run is not a case we stop
         // watching -- it is the case we most need to come back to.
         if (date_valid(today)) n.next_check = date_add_days(today, recheck_days);
@@ -276,6 +280,10 @@ Case apply_check(const Case& c, Outcome o, Reason r,
     // Listed and NotFound are both CLEAN FETCHES. Either one proves the tunnel,
     // the URL and the parser all worked, so the failure streak resets on both.
     n.consecutive_failures = 0;
+    // The other streak moves the other way: a clean absence is evidence toward
+    // "gone", and one sighting wipes it out entirely.
+    if (o == Outcome::NotFound) ++n.clean_absences;
+    else                        n.clean_absences = 0;
     if (date_valid(today)) {
         n.last_verified = today;
         n.next_check    = date_add_days(today, recheck_days);
@@ -285,6 +293,56 @@ Case apply_check(const Case& c, Outcome o, Reason r,
     // evidence toward "removed", not the decision itself -- brokers 404 a page
     // and re-serve it under a new slug, and a single fetch cannot tell those
     // apart. Promotion is a caller's judgment, made with the streak in view.
+    return n;
+}
+
+const char* promotion_name(Promotion p) {
+    switch (p) {
+        case Promotion::None:     return "none";
+        case Promotion::Removed:  return "removed";
+        case Promotion::Returned: return "returned";
+    }
+    return "none";
+}
+
+Promotion promotion_for(const Case& c, const PromotionRule& r) {
+    // Terminal. A relisted case has a successor carrying the story now, and an
+    // abandoned one is a decision we already made.
+    if (c.status == Status::Relisted || c.status == Status::Abandoned)
+        return Promotion::None;
+
+    // The record is back. This outranks everything below it: a case we believed
+    // gone that fetches Listed is the single event this app was built to catch,
+    // and it is true regardless of how many clean absences preceded it.
+    if (c.status == Status::Removed && c.outcome == Outcome::Listed)
+        return Promotion::Returned;
+    if (c.status == Status::Removed) return Promotion::None;
+
+    // The LAST look has to be the clean one. A streak of absences followed by a
+    // sighting is a case that came back before we ever called it gone.
+    if (c.outcome != Outcome::NotFound) return Promotion::None;
+
+    // SelfVerified without a date fails validation, and a promotion that writes
+    // an invalid case is worse than one that waits for the next check.
+    if (c.last_verified.empty()) return Promotion::None;
+
+    int needed = r.clean_absences_required;
+    if (r.claim_counts_as_one &&
+        (c.provenance == Provenance::BrokerClaim || c.provenance == Provenance::PlatformClaim))
+        --needed;
+    if (needed < 1) needed = 1;   // never zero: something has to have been seen
+
+    return c.clean_absences >= needed ? Promotion::Removed : Promotion::None;
+}
+
+Case apply_promotion(const Case& c, const PromotionRule& r) {
+    Case n = c;
+    if (promotion_for(c, r) != Promotion::Removed) return n;
+    n.status = Status::Removed;
+    // Not BrokerClaim, whatever was there before: we fetched the live page and
+    // it was gone. That is the strongest evidence in the schema and it is ours,
+    // and overwriting a claim with it is the entire point of the app.
+    n.provenance = Provenance::SelfVerified;
     return n;
 }
 
@@ -371,6 +429,8 @@ std::vector<std::string> caseload_validate(const Caseload& c) {
 
         if (k.consecutive_failures < 0)
             problems.push_back(ref + ": negative consecutive_failures");
+        if (k.clean_absences < 0)
+            problems.push_back(ref + ": negative clean_absences");
         if (!k.supersedes.empty() && k.supersedes == k.id)
             problems.push_back(ref + ": supersedes itself");
     }
@@ -420,6 +480,7 @@ Caseload caseload_load(const std::string& file, std::string* error) {
         k.last_verified = e.value("last_verified", "");
         k.next_check    = e.value("next_check", "");
         k.consecutive_failures = e.value("consecutive_failures", 0);
+        k.clean_absences       = e.value("clean_absences", 0);
         k.supersedes = e.value("supersedes", "");
         k.note       = e.value("note", "");
         if (e.contains("exposes") && e["exposes"].is_array())
@@ -449,6 +510,7 @@ bool caseload_save(const std::string& file, const Caseload& c) {
             {"last_verified", k.last_verified},
             {"next_check",    k.next_check},
             {"consecutive_failures", k.consecutive_failures},
+            {"clean_absences",       k.clean_absences},
             {"exposes",    fields},
             {"supersedes", k.supersedes},
             {"note",       k.note},

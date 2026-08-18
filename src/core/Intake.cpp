@@ -349,4 +349,22 @@ bool caseload_commit(Caseload& c, const Case& fresh) {
     return true;
 }
 
+bool caseload_record_return(Caseload& c, const std::string& case_id,
+                            const std::string& today, int recheck_days,
+                            std::string* new_id) {
+    const Case* old = caseload_find(c, case_id);
+    if (old == nullptr) return false;
+    if (promotion_for(*old) != Promotion::Returned) return false;
+
+    Case succ = relist_successor(*old, next_case_id(c, old->broker_id, today), today);
+    // relist_successor carries the predecessor's next_check forward; that date
+    // is the one that just came due, so it is behind us. The successor is a
+    // live listing again and goes back on the normal rhythm.
+    if (date_valid(today)) succ.next_check = date_add_days(today, recheck_days);
+
+    if (!caseload_commit(c, succ)) return false;
+    if (new_id) *new_id = succ.id;
+    return true;
+}
+
 }  // namespace delr::core

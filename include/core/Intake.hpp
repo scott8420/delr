@@ -155,4 +155,23 @@ Case intake_relist_case(const IntakeReport& rep, const Caseload& c,
 // no url, duplicate id) or names a predecessor that isn't here.
 bool caseload_commit(Caseload& c, const Case& fresh);
 
+// ── When the machine finds it itself ─────────────────────────────────────────
+// A scheduled check fetched a case we believed Removed and the record was
+// there. Ends the predecessor at Relisted and opens the successor, in one call
+// -- `caseload_commit` does both halves and this is why that rule exists.
+//
+// The same shape as the pasted relist above, with one difference that matters:
+// this successor's `outcome = Listed, last_verified = today` is OUR FETCH
+// saying so. The pasted path writes those fields on the strength of a human
+// sighting, which is the one seam where this schema lets an eyeball count as a
+// clean observation. Here it does not have to, and that is the point of having
+// built the fetch.
+//
+// Refuses (and changes nothing) unless the case exists and
+// `promotion_for()` says Returned -- the judgment stays in one place.
+// Writes the successor's id through `new_id` when given.
+bool caseload_record_return(Caseload& c, const std::string& case_id,
+                            const std::string& today, int recheck_days,
+                            std::string* new_id = nullptr);
+
 }  // namespace delr::core

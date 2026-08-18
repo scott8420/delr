@@ -8,6 +8,7 @@
 #include "selftest.hpp"
 #include "core/Broker.hpp"
 #include "core/Case.hpp"
+#include "core/Egress.hpp"
 #include "core/Intake.hpp"
 
 #include <cstdio>
@@ -49,6 +50,32 @@ Broker mk(const std::string& id, Method m) {
     if (m == Method::Email) b.opt_out_email = "privacy@" + id + ".example";
     return b;
 }
+// A policy and an observation that agree: the tunnel is up, bound, at a known
+// exit, with lookups proxied. Every egress test below is this pair with exactly
+// one thing broken.
+EgressPolicy mkpolicy() {
+    EgressPolicy p;
+    p.interface_name = "wg0";
+    p.accepted_exits = {"203.0.113.9"};
+    p.naked_exit     = "198.51.100.7";
+    p.dns            = DnsMode::Proxied;
+    p.preflight_ttl_s = 300;
+    return p;
+}
+
+EgressObservation mkobs() {
+    EgressObservation o;
+    o.interface_present = true;
+    o.interface_up      = true;
+    o.interface_address = "10.7.0.2";
+    o.bound             = true;
+    o.bound_address     = "10.7.0.2";
+    o.observed_exit     = "203.0.113.9";
+    o.canary            = Canary::Clean;
+    o.observed_at_s     = 1000;
+    return o;
+}
+const std::int64_t kNow = 1100;   // 100s after the observation; ttl is 300
 }  // namespace
 
 namespace delr::selftest {
@@ -601,6 +628,379 @@ int run() {
         check(back[0].exposes == k.exposes, "the exposure list survives");
         check(caseload_validate(back).empty(), "and the reloaded caseload validates");
         std::remove(f.c_str());
+    }
+
+
+
+    std::printf("\nclean absences accumulate\n");
+    {
+        Case k = mkcase("spokeo-20260115", "spokeo");
+        k = apply_check(k, Outcome::NotFound, Reason::None, "2026-03-01", 45);
+        check(k.clean_absences == 1, "a clean absence counts");
+        k = apply_check(k, Outcome::Indeterminate, Reason::Blocked, "2026-04-15", 3);
+        check(k.clean_absences == 1, "a check we could not run neither advances nor breaks the streak");
+        check(k.consecutive_failures == 1, "but it is a failure");
+        k = apply_check(k, Outcome::NotFound, Reason::None, "2026-04-18", 45);
+        check(k.clean_absences == 2, "the next clean absence continues the streak");
+        check(k.consecutive_failures == 0, "and clears the failures");
+        k = apply_check(k, Outcome::Listed, Reason::None, "2026-06-02", 45);
+        check(k.clean_absences == 0, "one sighting wipes the absence streak out");
+    }
+
+    std::printf("\nwhen a record is believed gone\n");
+    {
+        Case k = mkcase("spokeo-20260115", "spokeo");
+        check(promotion_for(k) == Promotion::None, "a fresh case is not going anywhere");
+
+        k = apply_check(k, Outcome::NotFound, Reason::None, "2026-03-01", 45);
+        check(promotion_for(k) == Promotion::None, "one clean absence is an event, not a pattern");
+        k = apply_check(k, Outcome::NotFound, Reason::None, "2026-04-15", 45);
+        check(promotion_for(k) == Promotion::Removed, "two is a pattern");
+
+        const Case done = apply_promotion(k);
+        check(done.status == Status::Removed, "the promotion moves the status");
+        check(done.provenance == Provenance::SelfVerified, "and records that WE are the ones who looked");
+        check(done.outcome == Outcome::NotFound, "what we saw is untouched by what we concluded");
+        Caseload one{done};
+        check(caseload_validate(one).empty(), "and a promoted case validates");
+
+        // A claim lowers the bar by one, and is overwritten when we agree.
+        Case claimed = mkcase("acme-20260115", "acme");
+        claimed.provenance = Provenance::BrokerClaim;
+        claimed = apply_check(claimed, Outcome::NotFound, Reason::None, "2026-03-01", 45);
+        check(promotion_for(claimed) == Promotion::Removed,
+              "a broker's claim plus our own clean fetch is two sources");
+        check(apply_promotion(claimed).provenance == Provenance::SelfVerified,
+              "and our fetch outranks the claim it agrees with");
+
+        PromotionRule strict; strict.claim_counts_as_one = false;
+        check(promotion_for(claimed, strict) == Promotion::None, "unless the rule refuses to count claims");
+        PromotionRule three; three.clean_absences_required = 3;
+        check(promotion_for(k, three) == Promotion::None, "a stricter rule needs a longer streak");
+        PromotionRule zero; zero.clean_absences_required = 0;
+        check(promotion_for(mkcase("x", "y"), zero) == Promotion::None,
+              "and no rule promotes a case nothing was ever seen on");
+
+        // The last look has to be the clean one.
+        Case back = apply_check(k, Outcome::Listed, Reason::None, "2026-06-02", 45);
+        check(promotion_for(back) == Promotion::None, "a sighting after the streak stops the promotion");
+
+        // A blocked fetch is not an absence.
+        Case blocked = mkcase("acme-20260201", "acme");
+        blocked = apply_check(blocked, Outcome::Indeterminate, Reason::UrlDead, "2026-03-01", 3);
+        blocked = apply_check(blocked, Outcome::Indeterminate, Reason::UrlDead, "2026-03-04", 3);
+        check(promotion_for(blocked) == Promotion::None,
+              "two dead URLs are not two clean absences -- a retired slug is not a removal");
+    }
+
+    std::printf("\nwhen the record comes back\n");
+    {
+        Case k = mkcase("spokeo-20260115", "spokeo");
+        k = apply_check(k, Outcome::NotFound, Reason::None, "2026-03-01", 45);
+        k = apply_check(k, Outcome::NotFound, Reason::None, "2026-04-15", 45);
+        k = apply_promotion(k);
+        check(promotion_for(k) == Promotion::None, "a removed case that stays gone stays put");
+
+        Case seen = apply_check(k, Outcome::Listed, Reason::None, "2026-06-01", 45);
+        check(promotion_for(seen) == Promotion::Returned, "a removed case fetched Listed has returned");
+
+        Case terminal = seen; terminal.status = Status::Abandoned;
+        check(promotion_for(terminal) == Promotion::None, "an abandoned case is a decision already made");
+        terminal.status = Status::Relisted;
+        check(promotion_for(terminal) == Promotion::None, "and a relisted one has a successor telling the story");
+    }
+
+    std::printf("\nthe return, recorded\n");
+    {
+        Case k = mkcase("spokeo-20260115", "spokeo");
+        k = apply_check(k, Outcome::NotFound, Reason::None, "2026-03-01", 45);
+        k = apply_check(k, Outcome::NotFound, Reason::None, "2026-04-15", 45);
+        k = apply_promotion(k);
+        k = apply_check(k, Outcome::Listed, Reason::None, "2026-06-01", 45);
+
+        Caseload c{k};
+        std::string fresh_id;
+        check(!caseload_record_return(c, "not-a-case", "2026-06-01", 45, &fresh_id),
+              "an unknown id is refused");
+        check(c.size() == 1, "and nothing was written");
+
+        check(caseload_record_return(c, k.id, "2026-06-01", 45, &fresh_id), "the return is recorded");
+        check(c.size() == 2, "as a second case, not an edit of the first");
+        check(c[0].status == Status::Relisted, "the predecessor ends at relisted");
+        check(c[1].supersedes == k.id, "and the successor names it");
+        check(c[1].id == fresh_id && !fresh_id.empty(), "the new id comes back to the caller");
+        check(c[1].status == Status::Found, "the successor starts over");
+        check(c[1].provenance == Provenance::None, "the old proof does not transfer");
+        check(c[1].outcome == Outcome::Listed, "our own fetch saw it there");
+        check(c[1].last_verified == "2026-06-01", "and that IS a clean verification, unlike a pasted sighting");
+        check(c[1].clean_absences == 0, "the absence streak does not survive the return");
+        check(c[1].next_check == "2026-07-16", "the successor goes back on the normal rhythm");
+        check(c[1].exposes == k.exposes, "the exposure list carries forward as a starting assumption");
+        check(caseload_validate(c).empty(), "and the caseload still validates");
+
+        check(!caseload_record_return(c, c[1].id, "2026-06-01", 45), "a live case has not returned from anything");
+
+        const std::string f = tmp_path("delr_return_cases.json");
+        check(caseload_save(f, c), "the relist pair saves");
+        std::string err;
+        Caseload load = caseload_load(f, &err);
+        check(err.empty() && load.size() == 2, "and loads back");
+        check(load[0].status == Status::Relisted && load[1].supersedes == load[0].id,
+              "with the history intact");
+        std::remove(f.c_str());
+    }
+
+    std::printf("\nabsence streak survives the pump\n");
+    {
+        Caseload c{mkcase("spokeo-20260115", "spokeo")};
+        c[0].clean_absences = 3;
+        const std::string f = tmp_path("delr_absence_cases.json");
+        check(caseload_save(f, c), "saved");
+        std::string err;
+        Caseload back = caseload_load(f, &err);
+        check(err.empty() && back.size() == 1 && back[0].clean_absences == 3,
+              "the absence streak round-trips");
+        c[0].clean_absences = -1;
+        check(caseload_validate(c).size() == 1, "a negative streak is caught");
+        std::remove(f.c_str());
+    }
+
+    std::printf("\naddress kinds\n");
+    check(addr_kind("203.0.113.9")     == AddrKind::Public,    "a routable v4 is public");
+    check(addr_kind("10.7.0.2")        == AddrKind::Private,   "10/8 is private");
+    check(addr_kind("172.16.0.1")      == AddrKind::Private,   "172.16/12 is private");
+    check(addr_kind("172.32.0.1")      == AddrKind::Public,    "172.32 is outside 172.16/12");
+    check(addr_kind("192.168.1.1")     == AddrKind::Private,   "192.168/16 is private");
+    check(addr_kind("100.64.0.1")      == AddrKind::Private,   "CGNAT is not a public identity");
+    check(addr_kind("127.0.0.1")       == AddrKind::Loopback,  "127/8 is loopback");
+    check(addr_kind("169.254.1.1")     == AddrKind::LinkLocal, "169.254/16 is link-local");
+    check(addr_kind("0.0.0.0")         == AddrKind::Invalid,   "0.0.0.0 is not a host");
+    check(addr_kind("239.1.1.1")       == AddrKind::Invalid,   "multicast is not a unicast host");
+    check(addr_kind("010.1.1.1")       == AddrKind::Invalid,   "a leading zero is refused, not guessed");
+    check(addr_kind("1.2.3")           == AddrKind::Invalid,   "three octets is not an address");
+    check(addr_kind("1.2.3.256")       == AddrKind::Invalid,   "an octet over 255 is refused");
+    check(addr_kind("1.2.3.4.5")       == AddrKind::Invalid,   "five octets is refused");
+    check(addr_kind("")                == AddrKind::Invalid,   "empty is invalid");
+    check(addr_kind("  203.0.113.9  ") == AddrKind::Public,    "surrounding whitespace survives");
+
+    check(addr_kind("2001:db8::1")  == AddrKind::Public,    "a routable v6 is public");
+    check(addr_kind("::1")          == AddrKind::Loopback,  "::1 is loopback");
+    check(addr_kind("fd00::1")      == AddrKind::Private,   "fc00::/7 is private");
+    check(addr_kind("fe80::1")      == AddrKind::LinkLocal, "fe80::/10 is link-local");
+    check(addr_kind("ff02::1")      == AddrKind::Invalid,   "v6 multicast is not a host");
+    check(addr_kind("::")           == AddrKind::Invalid,   ":: is not a host");
+    check(addr_kind("gggg::1")      == AddrKind::Invalid,   "non-hex is refused");
+    check(addr_kind("1:2:3:4:5:6:7:8:9") == AddrKind::Invalid, "nine groups is refused");
+    check(addr_kind("1:2:3:4:5:6:7")     == AddrKind::Invalid, "seven groups without :: is refused");
+    check(addr_kind("2001::db8::1")      == AddrKind::Invalid, "two :: is ambiguous, so refused");
+    check(addr_kind("2001:db8::1:")      == AddrKind::Invalid, "a trailing colon is refused");
+    check(addr_kind("::ffff:203.0.113.9") == AddrKind::Public, "a v4-mapped address takes the v4 kind");
+    check(addr_kind("::ffff:10.7.0.2")    == AddrKind::Private, "and a private one stays private");
+
+    std::printf("\naddress comparison\n");
+    check(addr_canonical("2001:db8::1") == addr_canonical("2001:0db8:0000:0000:0000:0000:0000:0001"),
+          "short and long v6 forms canonicalise the same");
+    check(addr_same("2001:DB8::1", "2001:db8:0:0:0:0:0:1"), "case and zero-compression do not matter");
+    check(addr_same("::ffff:203.0.113.9", "203.0.113.9"), "a v4-mapped address is that v4 address");
+    check(addr_same("203.0.113.9", "203.0.113.9"), "an address equals itself");
+    check(!addr_same("203.0.113.9", "203.0.113.10"), "a different address is different");
+    check(!addr_same("garbage", "garbage"), "two unreadable strings are not a match");
+    check(!addr_same("", ""), "and neither are two empty ones");
+    check(addr_canonical("nonsense").empty(), "an unreadable address has no comparison form");
+
+    std::printf("\ndns mode round-trip\n");
+    for (auto m : {DnsMode::Unset, DnsMode::System, DnsMode::Pinned, DnsMode::Proxied})
+        check(dns_mode_from(dns_mode_name(m)) == m,
+              std::string("dns mode '") + dns_mode_name(m) + "' survives name->from");
+    check(dns_mode_from("whatever") == DnsMode::Unset, "an unrecognised mode reads as unset, not as system");
+
+    std::printf("\negress policy validation\n");
+    check(egress_policy_validate(mkpolicy()).empty(), "a workable policy reports no problems");
+    {
+        EgressPolicy p = mkpolicy(); p.interface_name.clear();
+        check(egress_policy_validate(p).size() == 1, "no interface is caught");
+
+        p = mkpolicy(); p.dns = DnsMode::System;
+        check(!egress_policy_validate(p).empty(), "the system resolver is a policy error, not an option");
+
+        p = mkpolicy(); p.dns = DnsMode::Pinned;
+        check(!egress_policy_validate(p).empty(), "pinned with no resolver is caught");
+        p.resolver = "10.7.0.1";
+        check(egress_policy_validate(p).empty(), "pinned with a resolver is clean");
+
+        p = mkpolicy(); p.accepted_exits.push_back(p.naked_exit);
+        check(!egress_policy_validate(p).empty(), "our own address on the accepted list is caught");
+
+        p = mkpolicy(); p.accepted_exits = {"192.168.1.5"};
+        check(!egress_policy_validate(p).empty(), "a private accepted exit is caught");
+
+        p = mkpolicy(); p.accepted_exits.clear(); p.naked_exit.clear();
+        check(!egress_policy_validate(p).empty(), "nothing to compare against is caught");
+
+        p = mkpolicy(); p.preflight_ttl_s = 0;
+        check(!egress_policy_validate(p).empty(), "a zero preflight lifetime is caught");
+    }
+
+    std::printf("\negress: the clear case\n");
+    check(egress_check(mkpolicy(), mkobs(), kNow) == Verdict::Pass, "a good policy and a good observation pass");
+    check(egress_may_fetch(mkpolicy(), mkobs(), kNow), "and the fetch is allowed");
+    check(verdict_clear(Verdict::Pass), "only Pass is clear");
+    check(!verdict_clear(Verdict::Stale), "stale is not clear");
+
+    std::printf("\negress fails closed\n");
+    check(egress_check(EgressPolicy{}, EgressObservation{}, kNow) == Verdict::Unconfigured,
+          "an empty policy refuses");
+    check(egress_check(mkpolicy(), EgressObservation{}, kNow) == Verdict::NoInterface,
+          "an empty observation refuses");
+    check(!egress_may_fetch(EgressPolicy{}, EgressObservation{}, 0), "and nothing may leave");
+    {
+        // A policy error outranks a perfect observation: no preflight can clear it.
+        EgressPolicy p = mkpolicy(); p.dns = DnsMode::Unset;
+        check(egress_check(p, mkobs(), kNow) == Verdict::DnsUnset, "an unset resolver refuses a perfect tunnel");
+        p.dns = DnsMode::System;
+        check(egress_check(p, mkobs(), kNow) == Verdict::DnsSystem, "and so does the system resolver");
+        p = mkpolicy(); p.dns = DnsMode::Pinned;
+        check(egress_check(p, mkobs(), kNow) == Verdict::ResolverMissing, "pinned with no resolver refuses");
+        p = mkpolicy(); p.interface_name = "   ";
+        check(egress_check(p, mkobs(), kNow) == Verdict::Unconfigured, "a whitespace interface name is no name");
+        p = mkpolicy(); p.accepted_exits.clear(); p.naked_exit.clear();
+        check(egress_check(p, mkobs(), kNow) == Verdict::ExitUnpinned,
+              "with nothing to compare against, the preflight cannot answer and we refuse");
+    }
+
+    std::printf("\negress: can anything leave off-tunnel\n");
+    {
+        EgressObservation o = mkobs(); o.interface_present = false;
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::NoInterface, "a missing interface refuses");
+        o = mkobs(); o.interface_up = false;
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::InterfaceDown, "a down interface refuses");
+        o = mkobs(); o.bound = false;
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::NotBound,
+              "an unbound socket refuses even with a healthy tunnel");
+        o = mkobs(); o.bound_address = "192.168.1.20";
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::BindMismatch, "bound to the wrong address refuses");
+        o = mkobs(); o.bound_address.clear();
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::BindMismatch, "bound to nothing in particular refuses");
+        o = mkobs(); o.v6_default_offtunnel = true;
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::V6OffTunnel,
+              "a v6 route around the tunnel refuses while the tunnel looks healthy");
+        // The bind is judged before the far end: a dead tunnel we never bound to
+        // reports the bind, because that is the thing that would have leaked.
+        o = mkobs(); o.bound = false; o.observed_exit = mkpolicy().naked_exit;
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::NotBound, "the bind is reported before the exit");
+    }
+
+    std::printf("\negress: freshness\n");
+    {
+        EgressObservation o = mkobs();
+        check(egress_check(mkpolicy(), o, 1000 + 300) == Verdict::Pass, "an observation exactly at the ttl still passes");
+        check(egress_check(mkpolicy(), o, 1000 + 301) == Verdict::Stale, "one second past it does not");
+        check(egress_check(mkpolicy(), o, 999) == Verdict::Stale, "an observation from the future is not evidence");
+        o.observed_at_s = 0;
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::Stale, "a preflight that never ran reads as stale");
+    }
+
+    std::printf("\negress: is this the tunnel I meant\n");
+    {
+        EgressObservation o = mkobs(); o.observed_exit.clear();
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::ExitUnobserved, "no reported exit refuses");
+        o = mkobs(); o.observed_exit = "not-an-address";
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::ExitUnobserved, "an unreadable exit is no exit");
+        o = mkobs(); o.observed_exit = "192.168.1.30";
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::ExitPrivate, "a private exit means something intercepted us");
+        o = mkobs(); o.observed_exit = "127.0.0.1";
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::ExitPrivate, "and so does a loopback one");
+        o = mkobs(); o.observed_exit = "198.51.100.7";
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::ExitNaked, "our own address is the refusal this file exists for");
+        o = mkobs(); o.observed_exit = "203.0.113.99";
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::ExitUnexpected, "an unrecognised exit refuses");
+
+        // Naked outranks the accepted list, so a bad "trust this exit" click
+        // cannot whitelist the one address the policy exists to refuse.
+        EgressPolicy p = mkpolicy(); p.accepted_exits.push_back(p.naked_exit);
+        o = mkobs(); o.observed_exit = p.naked_exit;
+        check(egress_check(p, o, kNow) == Verdict::ExitNaked, "our own address is refused even if it is on the list");
+
+        // Several exits accepted: a provider rotating nodes is normal.
+        p = mkpolicy(); p.accepted_exits = {"203.0.113.9", "203.0.113.20"};
+        o = mkobs(); o.observed_exit = "203.0.113.20";
+        check(egress_check(p, o, kNow) == Verdict::Pass, "a second accepted exit passes");
+
+        // No accepted list, naked known: public-and-not-us is the whole test.
+        p = mkpolicy(); p.accepted_exits.clear();
+        o = mkobs(); o.observed_exit = "203.0.113.99";
+        check(egress_check(p, o, kNow) == Verdict::Pass, "with no list, any public address that is not ours passes");
+        o.observed_exit = p.naked_exit;
+        check(egress_check(p, o, kNow) == Verdict::ExitNaked, "but ours still refuses");
+    }
+
+    std::printf("\negress: did the lookup go with it\n");
+    {
+        EgressObservation o = mkobs(); o.canary = Canary::NotRun;
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::CanaryNotRun, "an untested lookup path refuses");
+        o.canary = Canary::Failed;
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::CanaryFailed, "an inconclusive canary is not evidence of safety");
+        o.canary = Canary::Leaked;
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::CanaryLeaked, "a leaking canary refuses");
+
+        EgressPolicy p = mkpolicy(); p.dns = DnsMode::Pinned; p.resolver = "10.7.0.1";
+        o = mkobs(); o.observed_resolver = "10.7.0.1";
+        check(egress_check(p, o, kNow) == Verdict::Pass, "the pinned resolver answering passes");
+        o.observed_resolver = "192.168.1.1";
+        check(egress_check(p, o, kNow) == Verdict::ResolverMismatch, "a different resolver answering refuses");
+        o.observed_resolver.clear();
+        check(egress_check(p, o, kNow) == Verdict::ResolverMismatch, "and so does no resolver at all");
+        // Under Proxied the resolver is the proxy's business; demanding an
+        // address there would ask the observer to invent one.
+        check(egress_check(mkpolicy(), o, kNow) == Verdict::Pass, "proxied lookups need no resolver address");
+    }
+
+    std::printf("\negress verdicts are nameable and say nothing\n");
+    for (auto v : {Verdict::Pass, Verdict::Unconfigured, Verdict::DnsUnset, Verdict::DnsSystem,
+                   Verdict::ResolverMissing, Verdict::ExitUnpinned, Verdict::NoInterface,
+                   Verdict::InterfaceDown, Verdict::NotBound, Verdict::BindMismatch,
+                   Verdict::V6OffTunnel, Verdict::Stale, Verdict::ExitUnobserved,
+                   Verdict::ExitPrivate, Verdict::ExitNaked, Verdict::ExitUnexpected,
+                   Verdict::CanaryNotRun, Verdict::CanaryFailed, Verdict::CanaryLeaked,
+                   Verdict::ResolverMismatch}) {
+        const std::string name = verdict_name(v), text = verdict_text(v);
+        check(!name.empty() && !text.empty(), std::string("verdict '") + name + "' has a name and a sentence");
+        check(text.find('.') != std::string::npos, std::string("verdict '") + name + "' text is a sentence");
+    }
+    {
+        // The refusal a user screenshots must not carry their address.
+        const EgressPolicy p = mkpolicy();
+        bool leaks = false;
+        for (auto v : {Verdict::ExitNaked, Verdict::ExitUnexpected, Verdict::ResolverMismatch}) {
+            const std::string t = verdict_text(v);
+            if (t.find(p.naked_exit) != std::string::npos ||
+                t.find(p.accepted_exits[0]) != std::string::npos) leaks = true;
+        }
+        check(!leaks, "no verdict sentence contains an address");
+
+        const std::string ref = egress_log_ref(p, Verdict::ExitNaked);
+        check(ref == "egress:wg0/exit-naked", "the log ref names the interface and the verdict");
+        check(ref.find(p.naked_exit) == std::string::npos, "and carries no address");
+        check(egress_log_ref(EgressPolicy{}, Verdict::Unconfigured) == "egress:-/unconfigured",
+              "an unnamed interface still logs safely");
+    }
+
+    std::printf("\negress refusal on a case\n");
+    {
+        Case k = mkcase("spokeo-20260115", "spokeo");
+        k.consecutive_failures = 2;
+        k.last_verified = "2026-02-01";
+        const Case n = apply_egress_refusal(k, "2026-03-01");
+        check(n.outcome == Outcome::Indeterminate, "a refusal records indeterminate, never not-found");
+        check(n.reason == Reason::NoTunnel, "with the reason that has been waiting for a producer");
+        check(n.consecutive_failures == 2, "the listing's failure streak does not move: this was our fault");
+        check(n.last_attempt == "2026-03-01", "we did try, so the attempt date moves");
+        check(n.last_verified == "2026-02-01", "but nothing was verified");
+        check(n.next_check == "2026-03-02", "and it comes back tomorrow, not in 45 days");
+        check(n.status == k.status, "a refusal is not a judgment about the listing");
+        check(apply_egress_refusal(k, "2026-03-01", 0).next_check == "2026-03-02",
+              "a retry of zero days still comes back, tomorrow");
+        check(apply_egress_refusal(k, "2026-03-01", 7).next_check == "2026-03-08", "a longer retry is honoured");
     }
 
     std::printf("\n%d pass / %d fail\n", g_pass, g_fail);

@@ -57,9 +57,11 @@ Stub. What exists and is exercised:
 |---|---|---|
 | Broker roster + JSON pump + validation | `include/core/Broker.hpp`, `src/core/Broker.cpp` | exercised |
 | Caseload: status/outcome/provenance, dates, scheduling, exposure roll-up | `include/core/Case.hpp`, `src/core/Case.cpp` | exercised |
+| Promotion: when a listing is believed gone, and when it has come back | `include/core/Case.hpp`, `src/core/Case.cpp` | exercised |
 | Intake: URL parse, broker match by host, id minting, duplicate + relist detection | `include/core/Intake.hpp`, `src/core/Intake.cpp` | exercised |
+| Egress policy: bind, preflight identity, DNS mode, one named verdict | `include/core/Egress.hpp`, `src/core/Egress.cpp` | exercised; no socket under it yet |
 | Follows the desktop light/dark preference | `include/Appearance.hpp`, `src/Appearance.cpp` | working |
-| Core checks (`delr --selftest`) | `src/selftest.cpp` | 228 pass / 0 fail, run on demand |
+| Core checks (`delr --selftest`) | `src/selftest.cpp` | 418 pass / 0 fail, run on demand |
 | App shell, sidebar + stack, roster page | `src/Shell*.cpp` | compiles; **unverified visually** |
 | Cases page: status line, exposure roll-up, case list | `src/Shell_zones.cpp`, `src/Shell_handlers.cpp` | compiles; **unverified visually** |
 | Add a case: paste a URL, pick the broker, tick what it exposes | `include/AddCaseDialog.hpp`, `src/AddCaseDialog.cpp` | compiles; **unverified visually** |
@@ -70,9 +72,26 @@ other, and only the case where both agree counts as working.
 
 ## Next
 
-Egress policy (`core/Egress`: bind first, preflight, fail
-closed) · the verification fetch itself · roster fetched from a hosted repo with
-a baked-in fallback · profile storage, encrypted at rest.
+The socket layer under `core/Egress` (bind to the tunnel, run the preflight,
+fill in an observation) · the verification fetch itself · roster fetched from a
+hosted repo with a baked-in fallback · profile storage, encrypted at rest.
+
+The check goes out through a tunnel or it does not go out. `core/Egress` decides
+that as a pure function of a configured policy and an observation somebody else
+made, so the whole leak-or-not decision is exercised headless, before any socket
+exists to argue with it. Binding to the tunnel is the killswitch — a dead tunnel
+*fails* instead of falling back to the default route — and the preflight answers
+the question binding cannot: is this the tunnel I meant? A refusal is
+`Indeterminate` + `NoTunnel`, which never rounds to "not found", and never counts
+against the listing.
+
+Believing a record is gone is its own act, kept apart from recording what a
+fetch saw: two consecutive **clean absences** (a page that loaded and did not
+have you in it — never a 404, which is a retired slug and not a removal), or one
+plus a broker's claim, which is two independent sources rather than one source
+twice. Our own fetch then overwrites the claim it agrees with. A `Removed` case
+that fetches `Listed` again is the event the whole app exists to catch, and it
+opens a successor case rather than editing the old one.
 
 Two invariants the model already enforces, because they cannot be retrofitted
 into a report: **indeterminate never rounds to not-found**, and **who says a

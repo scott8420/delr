@@ -126,6 +126,17 @@ struct Case {
 
     int consecutive_failures = 0;  // resets on any clean fetch, either way
 
+    // Consecutive CLEAN fetches that found nothing. Separate from the failure
+    // count above and pointed the other way: this is the evidence that a record
+    // is gone, and "believed gone" is a claim that needs more than one look.
+    //
+    // A 404 does not land here. A dead URL is Indeterminate/UrlDead, never
+    // NotFound, because brokers retire a slug and re-serve the same record
+    // under a new one -- and the difference between "the page says you are not
+    // here" and "the page is missing" is the difference between removal and a
+    // rename.
+    int clean_absences = 0;
+
     std::vector<Field> exposes;    // observed on this listing
     std::string supersedes;        // the case this one replaces, after a relist
     std::string note;              // PII-adjacent by assumption. Never logged.
@@ -154,6 +165,44 @@ std::vector<FieldCount> exposure_by_field(const Caseload& c, bool include_remove
 Case apply_check(const Case& c, Outcome o, Reason r,
                  const std::string& today, int recheck_days);
 
+// ── Believing a record is gone ───────────────────────────────────────────────
+// `apply_check` records what a fetch SAW and deliberately stops there. This is
+// the separate act of deciding what to BELIEVE, kept apart because recording
+// and concluding are different jobs and only one of them is reversible by
+// looking again.
+struct PromotionRule {
+    // Clean absences before we will call a listing removed. Two, because one is
+    // an event and two is a pattern: brokers serve empty pages under load, and
+    // a single clean miss followed by 45 days of silence is exactly the story a
+    // removal service would sell you.
+    int  clean_absences_required = 2;
+
+    // A broker's or a state platform's claim lowers the bar by one. It is not
+    // evidence on its own -- the whole app exists because it is not -- but our
+    // own clean fetch AGREEING with a claim is two independent sources, and
+    // that is a different thing from one source twice.
+    bool claim_counts_as_one = true;
+};
+
+// What this case's own record now says should happen to it.
+enum class Promotion {
+    None,      // nothing has changed our mind
+    Removed,   // enough clean absences: believe it gone
+    Returned   // a Removed case is Listed again. The event this app exists for.
+};
+
+const char* promotion_name(Promotion p);
+
+// Pure, and reads only what is already on the case. Terminal cases yield None.
+Promotion promotion_for(const Case& c, const PromotionRule& r = {});
+
+// Apply a Promotion::Removed: status Removed, provenance SelfVerified. Anything
+// else comes back untouched -- Returned deliberately included, because a return
+// is two rows (the old case ends, a successor opens) and no single-case edit
+// can express it honestly. `caseload_record_return()` in core/Intake does that
+// one, where the caseload is in scope.
+Case apply_promotion(const Case& c, const PromotionRule& r = {});
+
 // Open the successor to a relisted case: same broker and URL, new id, status
 // Found, provenance cleared, `supersedes` wired. The caller ends the old one.
 Case relist_successor(const Case& old, const std::string& new_id,
@@ -169,7 +218,7 @@ std::string log_ref(const Case& c);
 //   - Indeterminate carries a Reason; every other outcome carries none
 //   - Removed carries a Provenance, and SelfVerified requires a last_verified
 //   - Relisted carries a successor's supersedes elsewhere -- not checkable here
-//   - consecutive_failures >= 0
+//   - consecutive_failures and clean_absences >= 0
 std::vector<std::string> caseload_validate(const Caseload& c);
 
 // Persistence pump. First-run tolerant: a missing file is an empty caseload,

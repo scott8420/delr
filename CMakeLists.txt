@@ -22,6 +22,10 @@ add_library(delr_core STATIC
     # pasted URL and a row in the caseload that can be decided without a
     # display -- which is all of it.
     src/core/Intake.cpp
+    # May this request leave, and out of which hole. Policy only -- no sockets,
+    # no resolver, no clock: the whole leak-or-not decision is a pure function
+    # of a configured policy and an observation, and so is exercised headless.
+    src/core/Egress.cpp
 )
 target_include_directories(delr_core PUBLIC include)
 # Vendored nlohmann/json (header-only, MIT), PRIVATE -- an implementation

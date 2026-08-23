@@ -211,6 +211,24 @@ std::vector<FieldCount> exposure_by_field(const Caseload& c, bool include_remove
 Case apply_check(const Case& c, Outcome o, Reason r,
                  const std::string& today, int recheck_days);
 
+// ── Filing, which is neither a check nor a belief ────────────────────────────
+// Records that a request went out: status moves to Requested and `requested`
+// gets a date. Outcome and reason are left ALONE -- a filing is not a look at
+// the page, and borrowing the check fields to describe one would make the
+// caseload claim we had seen something we had not. Same axis discipline as
+// `apply_check` refusing to touch `status`.
+//
+// `requested` is set only when it is EMPTY. A second request about the same
+// listing is a follow-up, and a statutory clock runs from the first one; an
+// app that moved the date every time the user re-sent would hand a broker a
+// fresh deadline for ignoring the last one. (The authoritative anchor is
+// `journal_filed_on` -- this field is the snapshot's copy of it.)
+//
+// Terminal cases come back untouched. Filing against a case already closed as
+// Removed, Relisted or Abandoned is not a transition this can express, and
+// silently reopening one would lose the reason it closed.
+Case apply_filed(const Case& c, const std::string& today);
+
 // ── Believing a record is gone ───────────────────────────────────────────────
 // `apply_check` records what a fetch SAW and deliberately stops there. This is
 // the separate act of deciding what to BELIEVE, kept apart because recording

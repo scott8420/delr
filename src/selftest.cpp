@@ -8,6 +8,7 @@
 #include "selftest.hpp"
 #include "core/Broker.hpp"
 #include "core/Case.hpp"
+#include "core/Compose.hpp"
 #include "core/Egress.hpp"
 #include "core/Intake.hpp"
 #include "core/Journal.hpp"
@@ -15,6 +16,7 @@
 #include "core/Probe.hpp"
 #include "core/Profile.hpp"
 #include "core/RosterImport.hpp"
+#include "core/Statute.hpp"
 #include "net/Fetch.hpp"
 #include "net/Observer.hpp"
 #include "Paths.hpp"
@@ -2411,10 +2413,10 @@ int run() {
         Saved s_state("DELR_STATE"), s_xdg("XDG_DATA_HOME"), s_home("HOME"),
               s_cases("DELR_CASES"), s_egress("DELR_EGRESS"),
               s_roster("DELR_ROSTER"), s_rules("DELR_RULES"),
-              s_assets("DELR_ASSETS");
+              s_assets("DELR_ASSETS"), s_statutes("DELR_STATUTES");
         for (const char* n : {"DELR_STATE", "XDG_DATA_HOME", "HOME",
                               "DELR_CASES", "DELR_EGRESS", "DELR_ROSTER",
-                              "DELR_RULES", "DELR_ASSETS"})
+                              "DELR_RULES", "DELR_ASSETS", "DELR_STATUTES"})
             ::unsetenv(n);
 
         // The refusal, first, because it is the interesting one. With no home
@@ -2462,6 +2464,12 @@ int run() {
         check(P::roster_file() == "/opt/delr/data/brokers.json" &&
                   P::rules_file() == "/opt/delr/data/pagerules.json",
               "assets resolve against the asset dir, not the state dir");
+        // The third asset, and it follows the other two rather than the
+        // profile. The law is the same on every machine in a jurisdiction;
+        // WHICH row applies to this user is the personal bit, and that lives
+        // on the profile under state.
+        check(P::statutes_file() == "/opt/delr/data/statutes.json",
+              "and the statutes are an asset, filed with them");
         ::setenv("XDG_DATA_HOME", "/elsewhere", 1);
         check(P::roster_file() == "/opt/delr/data/brokers.json",
               "and moving the state dir does not move them");
@@ -2890,6 +2898,41 @@ int run() {
               "malformed JSON yields an empty profile AND says why");
         std::filesystem::remove(f);
 
+        std::printf("\nresidency -- the field that is not a search term\n");
+        {
+            Profile p;
+            p.full_name = "Jane Q Public";
+            p.residency = "US-TN";
+            check(needle_count(p) == needle_count([&]{
+                      Profile q = p; q.residency.clear(); return q; }()),
+                  "residency adds no needles -- it is not a thing to look for");
+
+            Profile bad = p; bad.residency = "Tennessee";
+            check(!profile_validate(bad).empty(),
+                  "a malformed residency is complained about, not swallowed");
+            Profile none = p; none.residency.clear();
+            check(profile_validate(none).empty(),
+                  "and a blank one is legal, permanently");
+
+            check(profile_log_ref(p).find("TN") == std::string::npos,
+                  "the log ref does not carry where you live");
+
+            const std::string f = tmp_path("delr_selftest_residency.json");
+            std::filesystem::remove(f);
+            check(profile_save(f, p), "it writes");
+            check(profile_load(f).residency == "US-TN", "and round-trips");
+            {
+                // Hand-edited files happen, and a bare "tn" has to join to the
+                // statute table like every other value.
+                std::ofstream hand(f);
+                hand << R"({"profile":{"full_name":"Jane Q Public",)"
+                        R"("residency":"tn"}})" << "\n";
+            }
+            check(profile_load(f).residency == "US-TN",
+                  "a hand-edited bare state normalises on the way in");
+            std::filesystem::remove(f);
+        }
+
         std::printf("\npaths\n");
         check(delr::paths::profile_file().find("profile.json") != std::string::npos,
               "the profile lives beside the caseload, under state");
@@ -2905,9 +2948,14 @@ int run() {
                   && kind_from("checked") == Kind::Checked
                   && kind_from("opened") == Kind::Opened
                   && kind_from("declined") == Kind::Declined
-                  && kind_from("changed") == Kind::Changed,
+                  && kind_from("changed") == Kind::Changed
+                  && kind_from("filed") == Kind::Filed,
               "every kind round-trips through its name");
-        check(kind_from("filed") == Kind::Other,
+        // s16 wrote this check with "filed" as the stand-in for a label no
+        // binary understood, and s17 understands it. The property was never
+        // about that word -- it is about ANY word this binary does not know --
+        // so the example moves and the property stays. It will move again.
+        check(kind_from("amended") == Kind::Other,
               "and a kind from a newer delr lands as Other rather than nowhere");
 
         std::printf("\nthe builders read the case, not a second opinion\n");
@@ -3171,14 +3219,14 @@ int run() {
                 {
                     std::ofstream fut(g);
                     fut << R"({"seq":1,"date":"2026-06-01","case_id":"a",)"
-                           R"("broker_id":"spokeo","kind":"filed","outcome":"never",)"
+                           R"("broker_id":"spokeo","kind":"amended","outcome":"never",)"
                            R"("reason":"none","from":"unknown","to":"unknown",)"
                            R"("provenance":"none","other_id":""})" << "\n";
                 }
                 Journal fwd = journal_load(g);
                 check(fwd.size() == 1 && fwd[0].kind == Kind::Other,
                       "a kind we have never heard of decodes as Other");
-                check(fwd[0].kind_raw == "filed",
+                check(fwd[0].kind_raw == "amended",
                       "with its label kept -- the row is not flattened");
                 check(fwd[0].case_id == "a" && fwd[0].date == "2026-06-01",
                       "and everything we DO understand about it is still there");
@@ -3188,10 +3236,44 @@ int run() {
                 Entry pass = fwd[0];
                 check(journal_append(h, pass, 1), "it can be written back out");
                 Journal again = journal_load(h);
-                check(again.size() == 1 && again[0].kind_raw == "filed",
-                      "and comes back as 'filed', not as 'other' -- proof is not destroyed");
+                check(again.size() == 1 && again[0].kind_raw == "amended",
+                      "and comes back as 'amended', not as 'other' -- proof is not destroyed");
                 std::filesystem::remove(g);
                 std::filesystem::remove(h);
+
+                // ── The direction s16 could only test by proxy ───────────────
+                // That session pinned forward tolerance against a word it had
+                // invented, which proves the mechanism and not the migration.
+                // This is the real thing: a row an s16 binary would have
+                // handed back as Other, read by the binary that now owns the
+                // kind. It has to come back as the kind, not as the label.
+                const std::string m = tmp_path("delr_journal_fwd3.ndjson");
+                std::filesystem::remove(m);
+                {
+                    std::ofstream older(m);
+                    older << R"({"seq":1,"date":"2026-06-01","case_id":"a",)"
+                             R"("broker_id":"spokeo","kind":"filed","outcome":"never",)"
+                             R"("reason":"none","from":"unknown","to":"unknown",)"
+                             R"("provenance":"none","other_id":"","channel":"email"})"
+                          << "\n";
+                }
+                Journal now = journal_load(m);
+                check(now.size() == 1 && now[0].kind == Kind::Filed &&
+                          now[0].kind_raw.empty(),
+                      "and a kind this binary DOES know comes back as the kind, not the label");
+                check(now[0].channel == Method::Email,
+                      "with the channel it went out on");
+                check(journal_validate(now).empty(),
+                      "and validates -- the round trip through an older binary cost nothing");
+
+                // The row as an s16 binary would have written it back: label
+                // preserved, but nothing it could not parse. A `filed` with no
+                // channel is exactly that, and validation is what notices.
+                Journal lossy = now;
+                lossy[0].channel = Method::Unknown;
+                check(!journal_validate(lossy).empty(),
+                      "a filing with no channel cannot anchor a follow-up, and is said so");
+                std::filesystem::remove(m);
             }
 
             std::printf("\nthe append never refuses on content\n");
@@ -3212,12 +3294,470 @@ int run() {
             std::filesystem::remove(f);
         }
 
+        std::printf("\nfiling -- an act the app records and does not perform\n");
+        {
+            Case k = mkcase("c9", "spokeo");
+            const Entry f = entry_filed(k, Method::Email, "2026-03-01");
+            check(f.kind == Kind::Filed && f.case_id == "c9" &&
+                      f.broker_id == "spokeo" && f.date == "2026-03-01",
+                  "the entry reads the case, like every other builder");
+            check(f.channel == Method::Email, "and carries the channel it went out on");
+            // A filing is not a look. Borrowing the check fields to describe
+            // one would make the history claim we saw something we did not.
+            check(f.outcome == Outcome::Never && f.reason == Reason::None,
+                  "and no outcome and no reason -- nothing was fetched");
+            check(std::string(log_ref(f)).find("spokeo") == std::string::npos,
+                  "its log ref names the case, not the broker");
+
+            Journal j;
+            Entry a = f; a.seq = 1;
+            j.push_back(a);
+            check(journal_validate(j).empty(), "a filing validates");
+
+            Entry no_channel = a; no_channel.channel = Method::Unknown;
+            Journal bad; bad.push_back(no_channel);
+            check(!journal_validate(bad).empty(), "one with no channel does not");
+            Entry with_outcome = a; with_outcome.outcome = Outcome::Listed;
+            Journal bad2; bad2.push_back(with_outcome);
+            check(!journal_validate(bad2).empty(), "nor one carrying an outcome");
+
+            // ── The anchor a deadline runs from ──────────────────────────────
+            check(journal_filed_on(j, "c9") == "2026-03-01",
+                  "the filing date is readable off the history");
+            check(journal_filed_on(j, "c1").empty(),
+                  "and a case that has never been filed for has no filing date");
+
+            // A second request is a follow-up. The clock still runs from the
+            // first one -- an app that moved the date every time the user
+            // re-sent would hand a broker a fresh deadline for ignoring the
+            // last one.
+            Entry again = entry_filed(k, Method::Web, "2026-05-01");
+            again.seq = 2;
+            j.push_back(again);
+            check(journal_filed_on(j, "c9") == "2026-03-01",
+                  "and a follow-up does not move it");
+
+            // The sentence the two tables produce together, and neither alone.
+            Statute law;
+            law.id = "us-tn-tipa"; law.jurisdiction = "US-TN";
+            law.name = "Tennessee Information Protection Act";
+            law.respond_days = 45; law.extension_days = 45;
+            check(statute_due(law, journal_filed_on(j, "c9")) == "2026-04-15",
+                  "a statutory deadline is the history's date and the statute's number");
+        }
+
+        std::printf("\napply_filed -- the caseload's own copy of it\n");
+        {
+            Case k = mkcase("c10", "spokeo");
+            k.outcome = Outcome::Listed;
+            check(k.status == Status::Found && k.requested.empty(),
+                  "a found case has asked for nothing yet");
+
+            Case filed = apply_filed(k, "2026-03-01");
+            check(filed.status == Status::Requested && filed.requested == "2026-03-01",
+                  "filing moves the standing and dates the request");
+            // Different axis, untouched. Same discipline as `apply_check`
+            // refusing to move `status`.
+            check(filed.outcome == Outcome::Listed && filed.reason == Reason::None &&
+                      filed.last_verified == k.last_verified &&
+                      filed.next_check == k.next_check,
+                  "and leaves what we SAW, and when we look next, exactly alone");
+
+            Case twice = apply_filed(filed, "2026-05-01");
+            check(twice.requested == "2026-03-01",
+                  "a second filing does not restart the clock");
+
+            for (Status s : {Status::Removed, Status::Relisted, Status::Abandoned}) {
+                Case term = k; term.status = s;
+                check(apply_filed(term, "2026-03-01").status == s,
+                      std::string("a ") + status_name(s) +
+                          " case comes back untouched rather than quietly reopened");
+            }
+
+            check(caseload_validate(Caseload{filed}).empty(),
+                  "and the result of a filing is a valid case");
+        }
+
         std::printf("\npaths\n");
         check(delr::paths::journal_file().find("journal.ndjson") != std::string::npos,
               "the journal lives under state with the caseload");
         check(delr::paths::journal_file() != delr::paths::cases_file()
                   && delr::paths::journal_file() != delr::paths::profile_file(),
               "and on top of nothing");
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // core/Statute -- the third asset class
+    // ─────────────────────────────────────────────────────────────────────────
+    std::printf("\nthe jurisdiction key\n");
+    {
+        check(jurisdiction_valid("US-CA") && jurisdiction_valid("US-TN"),
+              "US-CA is a key");
+        check(!jurisdiction_valid("CA"),
+              "a bare CA is not -- California and Canada are both CA to a human");
+        check(!jurisdiction_valid("us-ca") && !jurisdiction_valid("US-") &&
+                  !jurisdiction_valid(""),
+              "and neither is lowercase, a stub, or nothing");
+
+        check(jurisdiction_normalize("tn") == "US-TN",
+              "a bare two-letter state widens to US, in ONE place");
+        check(jurisdiction_normalize("  us-ca  ") == "US-CA",
+              "trimmed and uppercased");
+        // The important half. An unrecognised residency has to land on "no
+        // statute", which is safe, and never on the wrong one.
+        check(jurisdiction_normalize("California").empty() &&
+                  jurisdiction_normalize("Tennessee, USA").empty(),
+              "and anything it cannot make sense of comes back empty, not guessed");
+        check(jurisdiction_normalize("").empty(), "empty in, empty out");
+        check(jurisdiction_region("US-TN") == "TN" && jurisdiction_region("TN").empty(),
+              "the region is the part after the hyphen, or nothing");
+    }
+
+    std::printf("\nthe statute table\n");
+    {
+        Statutes t;
+        Statute ca;
+        ca.id = "us-ca-ccpa"; ca.jurisdiction = "US-CA";
+        ca.name = "California Consumer Privacy Act"; ca.short_name = "CCPA";
+        ca.citation = "Cal. Civ. Code s 1798.105";
+        ca.respond_days = 45; ca.extension_days = 45;
+        t.push_back(ca);
+
+        Statute tn;
+        tn.id = "us-tn-tipa"; tn.jurisdiction = "US-TN";
+        tn.name = "Tennessee Information Protection Act"; tn.short_name = "TIPA";
+        tn.respond_days = 45; tn.extension_days = 45;
+        t.push_back(tn);
+
+        check(statute_for(t, "US-CA") != nullptr, "a jurisdiction with a row finds it");
+        // The answer the whole module is shaped around. Most places have no
+        // deletion right and a null here is CORRECT, not a lookup failure.
+        check(statute_for(t, "US-WY") == nullptr,
+              "a jurisdiction without one gets null, which is a legitimate answer");
+        check(statute_for(t, "") == nullptr,
+              "and an empty residency matches nothing rather than the first row");
+        check(statute_find(t, "us-tn-tipa") != nullptr,
+              "and a filing can find the row it was filed under, by id");
+        check(statute_find(t, "us-xx-none") == nullptr && statute_find(t, "") == nullptr,
+              "by id, an unknown one is null too");
+
+        check(statute_due(ca, "2026-03-01") == "2026-04-15",
+              "the deadline is the filing date plus the statutory days");
+        check(statute_due_extended(ca, "2026-03-01") == "2026-05-30",
+              "and the extension is on top of it, not instead of it");
+
+        Statute none;
+        none.id = "x"; none.jurisdiction = "US-XX"; none.name = "None Act";
+        check(statute_due(none, "2026-03-01").empty(),
+              "a row that states no deadline produces no date -- never 'due today'");
+        check(statute_due(ca, "not-a-date").empty(),
+              "and an unusable filing date produces none either");
+
+        check(statutes_validate(t).empty(), "a clean table has nothing to say");
+
+        Statutes dupe = t;
+        Statute second_ca = ca; second_ca.id = "us-ca-other";
+        dupe.push_back(second_ca);
+        // The one duplicate that is not tidiness. Two rows for one place makes
+        // "which law am I invoking" depend on file order.
+        check(!statutes_validate(dupe).empty(),
+              "two statutes for one jurisdiction is refused, not resolved by order");
+
+        Statutes badid = t; badid.push_back(ca);
+        check(!statutes_validate(badid).empty(), "a duplicate id is refused");
+
+        Statutes shape = t; shape[0].jurisdiction = "USCA";
+        check(!statutes_validate(shape).empty(), "a malformed jurisdiction is refused");
+
+        Statutes nameless = t; nameless[1].name.clear();
+        check(!statutes_validate(nameless).empty(),
+              "and a row that cannot be named cannot be cited");
+
+        Statutes neg = t; neg[0].respond_days = -1;
+        check(!statutes_validate(neg).empty(), "negative days are refused");
+
+        const std::string f = tmp_path("delr_selftest_statutes.json");
+        std::filesystem::remove(f);
+        check(statutes_load(f).empty(),
+              "a missing table is empty, not an error -- every request composes as a courtesy");
+        check(statutes_save(f, t), "the table writes");
+        Statutes back = statutes_load(f);
+        check(back.size() == 2 && back[0].citation == ca.citation &&
+                  back[1].short_name == "TIPA" && back[0].extension_days == 45 &&
+                  back[1].requires_residency_statement,
+              "and round-trips -- what you save is what you load");
+        std::filesystem::remove(f);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // core/Compose -- the request, composed and never sent
+    // ─────────────────────────────────────────────────────────────────────────
+    std::printf("\nwhich channel a request would really use\n");
+    {
+        Broker e = mk("emailer", Method::Email);
+        Broker w = mk("former",  Method::Web);
+        check(compose_channel(e) == Method::Email && compose_channel(w) == Method::Web,
+              "a declared method with an address behind it is the channel");
+
+        Broker hollow = mk("hollow", Method::Email);
+        hollow.opt_out_email.clear();
+        check(compose_channel(hollow) == Method::Unknown,
+              "a declared method with NOTHING behind it is not a channel, whatever the column says");
+
+        Broker fallback = mk("fallback", Method::Unknown);
+        fallback.opt_out_email = "privacy@fallback.example";
+        check(compose_channel(fallback) == Method::Email,
+              "an address that exists beats a method that was never declared");
+
+        Broker drop = mk("dropper", Method::Drop);
+        check(compose_channel(drop) == Method::Drop,
+              "a drop-only broker with no address of its own has only the platform");
+        drop.opt_out_email = "privacy@dropper.example";
+        check(compose_channel(drop) == Method::Email,
+              "and gains a direct route the moment the roster holds one");
+
+        check(compose_channel(mk("caller", Method::Phone)) == Method::Phone &&
+                  compose_channel(mk("posty", Method::Postal)) == Method::Postal,
+              "phone and postal are reported as themselves rather than papered over");
+    }
+
+    std::printf("\nthe request\n");
+    {
+        Profile p;
+        p.full_name = "Jane Q Public";
+        p.emails = {"jane@example.org", "old@example.net"};
+        p.contact_email = "jane@example.org";
+        p.residency = "US-TN";
+        p.also_known_as = {"Jane Public", "J. Q. Public"};
+        p.places = {"Nashville, TN"};
+        p.phones = {"(615) 555-0100"};
+        p.note = "do not send this anywhere";
+
+        Statute law;
+        law.id = "us-tn-tipa"; law.jurisdiction = "US-TN";
+        law.name = "Tennessee Information Protection Act"; law.short_name = "TIPA";
+        law.respond_days = 45; law.extension_days = 45;
+
+        Broker b = mk("spokeo", Method::Email);
+        Case k = mkcase("spokeo-1", "spokeo");
+        k.outcome = Outcome::Listed;   // we have actually seen it
+        k.note = "found via a friend";
+
+        Request r = compose_request(p, b, k, &law, "2026-03-01");
+
+        check(r.sendable, "a whole profile, a real channel and a seen listing composes");
+        check(r.channel == Method::Email && r.to == "privacy@spokeo.example",
+              "addressed to the broker's own opt-out inbox");
+        check(r.body.find(k.url) != std::string::npos,
+              "the listing url is in it -- it is the only unambiguous handle on the record");
+        check(r.body.find("Jane Q Public") != std::string::npos,
+              "so is the name printed on that record");
+        check(r.body.find("jane@example.org") != std::string::npos,
+              "and an address for them to answer");
+        check(r.statute_id == "us-tn-tipa" && r.respond_days == 45,
+              "the request knows which row it stands on");
+        check(r.body.find("Tennessee Information Protection Act") != std::string::npos &&
+                  r.body.find("45 days") != std::string::npos,
+              "which it names, with the deadline that runs from it");
+        check(r.body.find("resident of TN") != std::string::npos,
+              "and asserts the residency that triggers the duty");
+
+        // ── Minimum viable disclosure, which is the whole design ─────────────
+        check(r.body.find("Jane Public") == std::string::npos &&
+                  r.body.find("Nashville") == std::string::npos &&
+                  r.body.find("555-0100") == std::string::npos &&
+                  r.body.find("old@example.net") == std::string::npos,
+              "and carries NONE of the rest of the profile by default");
+        check(!request_has(r, Caution::DisclosesExtra),
+              "a default request discloses nothing beyond the broker's own page");
+
+        // Free text never travels. Both notes are marked PII-adjacent, and
+        // free text is where a person writes what they would not have chosen
+        // to send.
+        check(r.body.find("do not send this anywhere") == std::string::npos &&
+                  r.body.find("found via a friend") == std::string::npos,
+              "neither note appears in the request. Ever.");
+
+        ComposeOptions opt;
+        opt.include_aliases = true;
+        opt.include_places  = true;
+        opt.include_phones  = true;
+        opt.include_emails  = true;
+        Request more = compose_request(p, b, k, &law, "2026-03-01", opt);
+        check(more.body.find("Jane Public") != std::string::npos &&
+                  more.body.find("Nashville, TN") != std::string::npos &&
+                  more.body.find("(615) 555-0100") != std::string::npos,
+              "turned on, each extra fact appears");
+        check(more.body.find("old@example.net") != std::string::npos,
+              "including the other addresses");
+        check(more.body.find("Please reply to jane@example.org") != std::string::npos,
+              "and the reply address is still asked for");
+        // Counted once, not twice: the address they are told to reply to is
+        // not also listed as an alternative.
+        check(more.body.find("    - jane@example.org") == std::string::npos,
+              "but the reply address is not ALSO listed as an extra");
+        check(request_has(more, Caution::DisclosesExtra),
+              "and the trade is stated rather than assumed");
+    }
+
+    std::printf("\nno row, no claim\n");
+    {
+        Profile p;
+        p.full_name = "Jane Q Public";
+        p.emails = {"jane@example.org"};
+        p.contact_email = "jane@example.org";
+        Broker b = mk("spokeo", Method::Email);
+        Case k = mkcase("spokeo-1", "spokeo");
+        k.outcome = Outcome::Listed;
+
+        // No residency and no law: the commonest state in the country.
+        Request r = compose_request(p, b, k, nullptr, "2026-03-01");
+        check(r.sendable, "a courtesy request still goes -- most brokers honour one");
+        check(r.statute_id.empty() && r.respond_days == 0,
+              "standing on no law, and saying so in the fields");
+        check(r.body.find("published privacy policy") != std::string::npos,
+              "the text asks under their own policy instead");
+        check(r.body.find("requires a response within") == std::string::npos,
+              "and claims NO deadline -- a bluff is checkable in thirty seconds");
+        check(r.body.find("resident of") == std::string::npos,
+              "nor states a residency it was never told");
+        check(request_has(r, Caution::NoStatute) && request_has(r, Caution::NoResidency),
+              "both are said out loud to the user");
+
+        Statute bare;
+        bare.id = "us-tn-tipa"; bare.jurisdiction = "US-TN";
+        bare.name = "Tennessee Information Protection Act";
+        bare.short_name = "TIPA"; bare.respond_days = 45;
+        p.residency = "US-TN";
+        Request named = compose_request(p, b, k, &bare, "2026-03-01");
+        check(named.body.find("Tennessee Information Protection Act") != std::string::npos,
+              "an unverified row still names the act");
+        // The fail-closed rule, one level down at the field. Compared against
+        // the same row WITH a citation, so the check is about the field and
+        // not about some other bracket happening to be absent.
+        Statute cited = bare;
+        cited.citation = "Tenn. Code s 47-18-0000";
+        Request with_cite = compose_request(p, b, k, &cited, "2026-03-01");
+        check(with_cite.body.find("Tenn. Code s 47-18-0000") != std::string::npos,
+              "a verified row DOES print its section number");
+        check(named.body.find("Tenn. Code") == std::string::npos &&
+                  named.body.find("(") == std::string::npos,
+              "and an unverified one cites nothing, because inventing one would be a bluff");
+        check(request_has(named, Caution::NoCitation),
+              "which the user is told, rather than left to notice");
+    }
+
+    std::printf("\nwhat the user has to know before they press send\n");
+    {
+        Profile p;
+        p.full_name = "Jane Q Public";
+        p.emails = {"jane@example.org"};
+        p.contact_email = "jane@example.org";
+        Case k = mkcase("x-1", "x");
+        k.outcome = Outcome::Listed;
+
+        Broker none = mk("nowhere", Method::Postal);
+        Request r = compose_request(p, none, k, nullptr, "2026-03-01");
+        check(!r.sendable && request_has(r, Caution::NoChannel),
+              "no address of any kind: nothing can go out");
+        check(!r.body.empty(),
+              "the text is composed anyway -- a user may still want to see what it WOULD say");
+
+        Broker phone = mk("callme", Method::Phone);
+        check(request_has(compose_request(p, phone, k, nullptr, "2026-03-01"),
+                          Caution::ChannelNotComposable),
+              "a telephone opt-out is not a letter and is not pretended into one");
+
+        Profile nameless = p; nameless.full_name.clear();
+        Request anon = compose_request(nameless, mk("spokeo", Method::Email), k,
+                                       nullptr, "2026-03-01");
+        check(!anon.sendable && request_has(anon, Caution::NoName),
+              "a request that cannot say whose record it is about does not go");
+
+        Profile noreply = p; noreply.contact_email.clear();
+        Request nr = compose_request(noreply, mk("spokeo", Method::Email), k,
+                                     nullptr, "2026-03-01");
+        check(request_has(nr, Caution::NoContactEmail) && nr.sendable,
+              "no reply address weakens the request without blocking it");
+        check(nr.body.find("Please reply to") == std::string::npos,
+              "and the letter does not ask them to reply to nowhere");
+
+        Broker id = mk("idcheck", Method::Email); id.requires_id = true;
+        check(request_has(compose_request(p, id, k, nullptr, "2026-03-01"),
+                          Caution::RequiresId),
+              "a photo-ID demand is surfaced before sending, not after");
+
+        Broker fcra = mk("bureau", Method::Email); fcra.fcra_regulated = true;
+        check(request_has(compose_request(p, fcra, k, nullptr, "2026-03-01"),
+                          Caution::FcraRegulated),
+              "an FCRA broker may lawfully refuse, and a refusal is a correct outcome");
+
+        Broker web = mk("formy", Method::Web);
+        Request wr = compose_request(p, web, k, nullptr, "2026-03-01");
+        check(wr.sendable && wr.channel == Method::Web &&
+                  wr.to == "https://formy.example/optout" &&
+                  request_has(wr, Caution::WebFormOnly),
+              "a web form is a channel, and the text is what to paste into it");
+
+        // The platform, and which side of it the user is on. Opposite
+        // instructions, so two values rather than one.
+        Broker drop = mk("dropper", Method::Drop);
+        drop.opt_out_email = "privacy@dropper.example";
+        Profile ca = p; ca.residency = "US-CA";
+        check(request_has(compose_request(ca, drop, k, nullptr, "2026-03-01"),
+                          Caution::DropCovered),
+              "a CA resident is told the platform reaches every broker at once");
+        Profile tn = p; tn.residency = "US-TN";
+        check(request_has(compose_request(tn, drop, k, nullptr, "2026-03-01"),
+                          Caution::DropNotYours),
+              "and a TN resident is told it will not help them");
+
+        // The sharpest one: filing against a listing we never saw hands a
+        // broker a name they may not have had.
+        Case unseen = mkcase("x-2", "x");
+        check(unseen.outcome == Outcome::Never, "a fresh case has never been checked");
+        check(request_has(compose_request(p, mk("spokeo", Method::Email), unseen,
+                                          nullptr, "2026-03-01"),
+                          Caution::UnverifiedListing),
+              "and filing against it is flagged: a disclosure with no confirmed target");
+        Case walled = mkcase("x-3", "x");
+        walled.outcome = Outcome::Indeterminate; walled.reason = Reason::EgressBlocked;
+        check(request_has(compose_request(p, mk("spokeo", Method::Email), walled,
+                                          nullptr, "2026-03-01"),
+                          Caution::UnverifiedListing),
+              "as is one we tried to see and were walled off from");
+
+        // Ordering is a contract: "there is nowhere to send this" must not sit
+        // under "they might ask for ID".
+        Broker bad = mk("nowhere2", Method::Postal);
+        bad.requires_id = true; bad.fcra_regulated = true;
+        Request messy = compose_request(nameless, bad, unseen, nullptr, "2026-03-01");
+        check(messy.cautions.size() >= 3 && caution_blocking(messy.cautions.front()),
+              "blocking cautions sort to the front");
+        check(!caution_blocking(messy.cautions.back()),
+              "and the rest follow");
+
+        // Every value carries words, and they are the core's words rather than
+        // a window's -- two surfaces cannot describe one caution differently.
+        for (Caution c : {Caution::NoName, Caution::NoChannel,
+                          Caution::ChannelNotComposable, Caution::NoContactEmail,
+                          Caution::NoResidency, Caution::NoStatute,
+                          Caution::NoCitation, Caution::WebFormOnly,
+                          Caution::RequiresId, Caution::FcraRegulated,
+                          Caution::DropCovered, Caution::DropNotYours,
+                          Caution::DisclosesExtra, Caution::UnverifiedListing}) {
+            if (std::string(caution_text(c)).empty() ||
+                std::string(caution_name(c)) == "unknown") {
+                check(false, std::string("caution ") + caution_name(c) + " has words");
+            }
+        }
+        check(true, "every caution has a name and a sentence");
+
+        check(compose_log_ref(r).find("http") == std::string::npos &&
+                  compose_log_ref(r).find("Jane") == std::string::npos &&
+                  compose_log_ref(r).find("example") == std::string::npos,
+              "and the log ref carries no name, no address and no url");
     }
 
     std::printf("\n%d pass / %d fail\n", g_pass, g_fail);

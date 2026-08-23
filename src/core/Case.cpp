@@ -321,6 +321,17 @@ const char* promotion_name(Promotion p) {
     return "none";
 }
 
+Case apply_filed(const Case& c, const std::string& today) {
+    if (c.status == Status::Removed || c.status == Status::Relisted ||
+        c.status == Status::Abandoned)
+        return c;
+
+    Case out = c;
+    out.status = Status::Requested;
+    if (out.requested.empty() && date_valid(today)) out.requested = today;
+    return out;
+}
+
 Promotion promotion_for(const Case& c, const PromotionRule& r) {
     // Terminal. A relisted case has a successor carrying the story now, and an
     // abandoned one is a decision we already made.

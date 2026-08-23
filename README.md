@@ -37,9 +37,30 @@ scraper needs its own parser, and every parser breaks on their schedule — and
 querying a broker for yourself can be a signal to them rather than an
 observation of them.
 
+**Sending is yours too, and that one is a design decision rather than a
+limitation.** delr drafts the opt-out request -- the right law, the listing, the
+minimum it can say and still be acted on -- and hands it to you to send from
+your own mail, in your own name. It holds no mail password, and the moment you
+press send is the moment you read what is about to leave. There is no Send
+button in this program and there is not going to be one.
+
 **Verification is the machine's.** Once a listing URL is known, checking
 whether it's still live is cheap, robust, and needs doing every 45 days
 forever. That's the job a computer should have.
+
+**The request says as little as it can.** Every other path in delr moves
+information toward you. Filing is the one that moves information *away*, to a
+company whose business is collecting it -- so the default request carries the
+listing URL, the name printed on that listing, and an address to reply to, and
+nothing else. The first two are the broker's own page handed back to them. Your
+other names, phone numbers, and cities are each an explicit tick, because each
+one is a fact they did not have before you asked them to hold less.
+
+**What you can demand depends on where you live.** Most US states grant no
+deletion right at all. Where delr has the law on file it names it and states
+the deadline; where it does not, the request asks under the broker's own posted
+policy and says so. It will not cite a statute you cannot invoke -- a bluff is
+checkable in thirty seconds by the desk that reads it.
 
 **Your profile is a search key, not a submission.** delr needs to know what a
 listing about you would print -- names you've gone by, places you've lived,

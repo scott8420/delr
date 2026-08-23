@@ -26,6 +26,7 @@ Shell::Shell()
       m_cases_maintenance("shell.cases.maintenance"),
       m_check_row("shell.cases.check", Gtk::Orientation::HORIZONTAL, 8),
       m_check_button("shell.cases.check.button"),
+      m_compose_button("shell.cases.compose.button"),
       m_check_state("shell.cases.check.state"),
       m_cases_scroll("shell.cases.scroll"),
       m_cases_list("shell.cases.list"),
@@ -46,6 +47,8 @@ Shell::Shell()
       m_profile_places("shell.profile.places"),
       m_profile_year_caption("shell.profile.year.caption"),
       m_profile_year("shell.profile.year"),
+      m_profile_residency_caption("shell.profile.residency.caption"),
+      m_profile_residency("shell.profile.residency"),
       m_profile_actions("shell.profile.actions", Gtk::Orientation::HORIZONTAL, 8),
       m_profile_save("shell.profile.save"),
       m_profile_status("shell.profile.status") {
@@ -75,6 +78,7 @@ void Shell::build_ui() {
     bind_actions();
     on_reload_roster();   // first paint from disk
     on_reload_rules();    // before the cases: the maintenance line reads it
+    on_reload_statutes(); // and the law table, which nothing else depends on
     on_reload_cases();
     // Before the egress reload, because the cases page's account of what a
     // check can currently prove depends on whether there is a profile to

@@ -209,6 +209,9 @@ void Shell::on_reload_cases() {
         }
     }
     refresh_check_button();
+    // Both buttons act on the selection, and the reload may have just restored
+    // one -- or failed to, if the case it remembered is gone.
+    refresh_compose_button();
 
     if (!err.empty()) {
         m_cases_status.set_text("Caseload failed to parse: " + err);
@@ -308,9 +311,13 @@ void Shell::on_reload_cases() {
     }
 }
 
-// A row was picked, or unpicked. The only thing that hangs off it is whether
-// there is something for the check button to act on.
-void Shell::on_case_selected() { refresh_check_button(); }
+// A row was picked, or unpicked. What hangs off it is whether the two buttons
+// have anything to act on -- and they answer that question differently: see
+// `refresh_compose_button`.
+void Shell::on_case_selected() {
+    refresh_check_button();
+    refresh_compose_button();
+}
 
 // ── Intake ───────────────────────────────────────────────────────────────────
 
@@ -385,6 +392,139 @@ std::string Shell::egress_file() const  { return paths::egress_file(); }
 
 // ── The run history ──────────────────────────────────────────────────────────
 
+
+// ── The law table ────────────────────────────────────────────────────────────
+// The third asset, loaded once beside the roster and the rules. It has no
+// status line: which law applies is a fact about the USER, so the place it
+// surfaces is the compose window, next to the request it is or is not standing
+// on. A count of rows in a table means nothing to anybody.
+void Shell::on_reload_statutes() {
+    std::string err;
+    m_statutes = core::statutes_load(paths::statutes_file(), &err);
+
+    auto lg = log::get(log::Area::Cases);
+    if (lg) {
+        if (!err.empty()) lg->error("statutes parse failed: {}", err);
+        else              lg->info("statutes loaded: {} row(s)", m_statutes.size());
+    }
+    for (const auto& p : core::statutes_validate(m_statutes))
+        if (lg) lg->warn("statutes: {}", p);
+}
+
+// ── Filing ───────────────────────────────────────────────────────────────────
+// Nothing leaves this machine on this path. That is not an implementation
+// detail to be improved on later; see core/Compose's header.
+
+void Shell::refresh_compose_button() {
+    const bool selected = m_cases_list.get_selected_row() != nullptr;
+    if (m_compose_action) m_compose_action->set_enabled(selected);
+
+    // Deliberately NOT gated on the tunnel, unlike its neighbour. A check is a
+    // request that leaves through an exit; a draft is a piece of text. Greying
+    // this out because the VPN is unconfigured would be the app refusing to
+    // write a letter over a network setting the letter never uses.
+    m_compose_button.set_tooltip_text(
+        selected ? "Draft an opt-out request for the selected listing. delr "
+                   "does not send it."
+                 : "Pick a case below first.");
+}
+
+void Shell::on_compose() {
+    auto* row = m_cases_list.get_selected_row();
+    if (!row) return;
+    const int i = row->get_index();
+    if (i < 0 || static_cast<std::size_t>(i) >= m_caseload.size()) return;
+    const core::Case& k = m_caseload[static_cast<std::size_t>(i)];
+
+    const core::Broker* b = core::roster_find(m_roster, k.broker_id);
+    if (!b) {
+        // A case whose broker is not in the roster cannot be addressed at all,
+        // and the compose window would have nothing to put in its "to" line.
+        // Said here rather than shown as an empty request.
+        m_check_state.set_text(
+            "That case names a broker that is not in the roster, so there is "
+            "nowhere to address a request. Reload the roster, or check the "
+            "case's broker id.");
+        return;
+    }
+
+    // Read from the PROFILE at compose time rather than held as a member: the
+    // You page can be edited while the app is up, and a request should stand
+    // on the residency the user has now.
+    const core::Statute* law = core::statute_for(m_statutes, m_profile.residency);
+
+    m_compose_dialog.open(*this, m_profile, *b, k, law, today());
+}
+
+// The user says they sent it. delr did not send anything and cannot witness a
+// send, so what goes on the record is exactly that: a person's claim, dated,
+// with the channel they used.
+void Shell::on_request_filed(std::string case_id, core::Method channel) {
+    auto lg = log::get(log::Area::Cases);
+
+    // By id, not by the index the dialog was opened from -- the caseload can
+    // have moved while the window was up. Same reasoning as `on_check_done`.
+    const std::string& id = case_id;
+    std::size_t at = m_caseload.size();
+    for (std::size_t i = 0; i < m_caseload.size(); ++i)
+        if (m_caseload[i].id == id) { at = i; break; }
+    if (at == m_caseload.size()) {
+        m_check_state.set_text(
+            "That case is no longer in the caseload, so nothing was recorded.");
+        return;
+    }
+
+    const core::Status was = m_caseload[at].status;
+    m_caseload[at] = core::apply_filed(m_caseload[at], today());
+
+    // Two rows, not one. The ACT and its CONSEQUENCE are separate facts and
+    // the journal's whole value is showing them as two -- the same reason a
+    // promotion does not rewrite the check that caused it.
+    bool kept = true;
+    core::Entry filed = core::entry_filed(m_caseload[at], channel, today());
+    kept = record_entry(filed);
+    if (m_caseload[at].status != was) {
+        core::Entry moved = core::entry_changed(m_caseload[at], was,
+                                                m_caseload[at].status, today());
+        if (!record_entry(moved)) kept = false;
+    }
+
+    if (lg) lg->info("filed: case:{} by {}", id, core::method_name(channel));
+
+    const std::string file = cases_file();
+    std::error_code ec;
+    std::filesystem::create_directories(Glib::path_get_dirname(file), ec);
+    if (!core::caseload_save(file, m_caseload)) {
+        if (lg) lg->error("filed: save failed");
+        m_check_state.set_text(
+            "Recorded that you sent it, but the caseload could NOT be saved — "
+            "see the log.");
+        return;
+    }
+
+    on_reload_cases();
+
+    // The sentence the two new tables produce together, and neither alone: the
+    // date came off the history, the number came off the statute.
+    std::string due;
+    const core::Statute* law = core::statute_for(m_statutes, m_profile.residency);
+    if (law) {
+        const core::Journal j = core::journal_load(journal_file());
+        const std::string on = core::journal_filed_on(j, id);
+        const std::string by = core::statute_due(*law, on);
+        if (!by.empty())
+            due = "  Under " + law->name + " they owe you an answer by " + by + ".";
+    }
+
+    m_check_state.set_text(
+        "Recorded: you sent a request to " +
+        (core::roster_find(m_roster, m_caseload[at].broker_id)
+             ? core::roster_find(m_roster, m_caseload[at].broker_id)->name
+             : m_caseload[at].broker_id) +
+        " by " + core::method_name(channel) + " on " + today() + "." + due +
+        (kept ? "" : "  (The history could not be written — see the log.)"));
+}
+
 std::string Shell::journal_file() const { return paths::journal_file(); }
 
 bool Shell::record_entry(core::Entry& e) {
@@ -441,12 +581,40 @@ void Shell::on_reload_profile() {
     m_profile_phones.set_text(core::terms_join(m_profile.phones));
     m_profile_usernames.set_text(core::terms_join(m_profile.usernames));
     m_profile_places.set_text(core::terms_join(m_profile.places));
+    // Painted as the region alone -- the user typed "TN" and should see "TN",
+    // not the "US-" the join key carries. `jurisdiction_normalize` puts it
+    // back on the way in.
+    m_profile_residency.set_text(core::jurisdiction_region(m_profile.residency));
 
     if (!err.empty()) {
         m_profile_status.set_text("The profile file could not be read: " + err);
     } else {
         const auto problems = core::profile_validate(m_profile);
         std::string line = core::profile_summary(m_profile);
+
+        // ── What this profile is WORTH when filing ──────────────────────────
+        // Said here rather than in `profile_summary`, which is pure and knows
+        // nothing about the statute table -- and said at all because the
+        // difference between a demand and a request is invisible otherwise,
+        // and a user would only discover it in the compose window with a
+        // letter already in front of them.
+        if (m_profile.residency.empty()) {
+            line += "\nNo residency set, so requests ask rather than demand. "
+                    "Most brokers honour a plain request; none of them owe you "
+                    "an answer by a date.";
+        } else if (const core::Statute* law =
+                       core::statute_for(m_statutes, m_profile.residency)) {
+            line += "\nRequests can be filed under " + law->name;
+            if (law->respond_days > 0)
+                line += ", which gives them " + std::to_string(law->respond_days) +
+                        " days to answer";
+            line += ".";
+        } else {
+            line += "\ndelr has no deletion law on file for " +
+                    core::jurisdiction_region(m_profile.residency) +
+                    ", so requests ask rather than demand.";
+        }
+
         for (const std::string& p : problems) line += "\n" + p;
         m_profile_status.set_text(line);
     }
@@ -466,6 +634,13 @@ void Shell::on_save_profile() {
     p.usernames     = core::terms_parse(m_profile_usernames.text());
     p.places        = core::terms_parse(m_profile_places.text());
     p.note          = m_profile.note;   // not on the form yet; not destroyed by it
+    // Normalised at the surface, and an unrecognised entry comes back EMPTY
+    // rather than guessed -- which lands on "no statute", the safe answer.
+    // The validator complains about the shape separately, so a typo is told
+    // about rather than silently swallowed.
+    p.residency     = core::jurisdiction_normalize(m_profile_residency.get_text());
+    if (p.residency.empty() && !m_profile_residency.get_text().empty())
+        p.residency = m_profile_residency.get_text();   // let the validator speak
 
     // A blank box is 0 -- "not given" -- and anything else is whatever the user
     // typed, handed to the validator UNCHANGED. Coercing "84" to 1984 here

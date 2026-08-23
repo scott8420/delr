@@ -99,6 +99,27 @@ struct Profile {
     // address the user never told it about.
     std::string contact_email;
 
+    // ── Where you live, which decides what you are OWED ──────────────────────
+    // "US-TN". A jurisdiction key in `core/Statute`'s format, joining to
+    // `Statute::jurisdiction` by equality -- see that header for why it is not
+    // a bare "TN".
+    //
+    // Not a search term, and the only field on this struct that is not. Every
+    // other line here answers "is this page about me"; this one answers "may I
+    // demand this, or am I asking a favour". It lives on the profile anyway
+    // because it is a fact about the PERSON -- residency is not a property of
+    // a broker, a listing or a page, and there is nowhere else honest to put
+    // it.
+    //
+    // Empty is the normal first-run state and stays legitimate forever: most
+    // US states grant no deletion right, and `core/Compose` composes a
+    // courtesy request rather than inventing a law. Empty must never be
+    // widened to a guess -- not from a phone area code, not from `places`, not
+    // from the exit address. Those are inferences about somebody's home from
+    // data collected for another purpose, which is the thing this program
+    // exists to oppose.
+    std::string residency;
+
     // Free text for the user. PII by assumption, like `Case::note`, and never
     // logged for the same reason.
     std::string note;

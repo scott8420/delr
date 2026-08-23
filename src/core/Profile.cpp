@@ -2,6 +2,8 @@
 // is a search key rather than an identity document.
 #include "core/Profile.hpp"
 
+#include "core/Statute.hpp"   // jurisdiction_valid / jurisdiction_normalize
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -79,7 +81,8 @@ std::string plural(std::size_t n, const char* one, const char* many) {
 bool profile_is_empty(const Profile& p) {
     return p.full_name.empty() && p.also_known_as.empty() && p.emails.empty()
         && p.phones.empty() && p.usernames.empty() && p.places.empty()
-        && p.birth_year == 0 && p.contact_email.empty() && p.note.empty();
+        && p.birth_year == 0 && p.contact_email.empty() && p.residency.empty()
+        && p.note.empty();
 }
 
 std::vector<std::string> terms_parse(const std::string& text) {
@@ -198,6 +201,12 @@ std::vector<std::string> profile_validate(const Profile& p) {
     if (p.birth_year != 0 && (p.birth_year < 1900 || p.birth_year > 2100))
         errs.push_back("Birth year should be a four-digit year, or blank.");
 
+    // Shape only, and blank stays legal. Whether a row exists for the place is
+    // `core/Statute`'s question and having no law is not a validation error --
+    // it changes what a request may claim, not whether the profile is sound.
+    if (!p.residency.empty() && !jurisdiction_valid(p.residency))
+        errs.push_back("Residency should look like \"US-TN\", or be blank.");
+
     for (const std::string& ph : p.phones)
         if (phone_digits(ph).empty())
             errs.push_back("\"" + ph + "\" does not have enough digits to be a "
@@ -303,6 +312,10 @@ Profile profile_load(const std::string& file, std::string* error) {
         p.birth_year = o["birth_year"].get<int>();
     if (o.contains("contact_email") && o["contact_email"].is_string())
         p.contact_email = tidy(o["contact_email"].get<std::string>());
+    // Normalised on the way IN as well as at the form, so a hand-edited file
+    // carrying "tn" joins to the statute table like every other one.
+    if (o.contains("residency") && o["residency"].is_string())
+        p.residency = jurisdiction_normalize(o["residency"].get<std::string>());
     if (o.contains("note") && o["note"].is_string())
         p.note = o["note"].get<std::string>();
     return p;
@@ -318,6 +331,7 @@ bool profile_save(const std::string& file, const Profile& p) {
     o["places"]        = p.places;
     o["birth_year"]    = p.birth_year;
     o["contact_email"] = p.contact_email;
+    o["residency"]     = p.residency;
     o["note"]          = p.note;
 
     json j;

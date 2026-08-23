@@ -47,6 +47,14 @@ add_library(delr_core STATIC
     # same header called that history "the evidence, and this app exists
     # because nobody else keeps it". This file closes the gap.
     src/core/Journal.cpp
+    # The third asset class, and the first one about the USER'S rights rather
+    # than about a broker or a page. Which law a person may invoke is a fact
+    # about where they live, not about anything a fetch can observe.
+    src/core/Statute.cpp
+    # The request itself. The one path in this program that moves information
+    # AWAY from the user, which is why every optional disclosure in it is off
+    # by default -- and why nothing here or above it opens a socket.
+    src/core/Compose.cpp
     # The pure half of the observer: everything between the bytes a syscall
     # hands back and the observation Egress judges. The syscalls themselves
     # land above this library; what their output MEANS is decided here, where
@@ -141,6 +149,10 @@ if(GTKMM_FOUND AND spdlog_FOUND)
         # category: it has its own lifetime (hide on close) and its own state,
         # and the Shell's split is by category of code, not by feature.
         src/AddCaseDialog.cpp
+        # The request window. A window of its own for the third time, and the
+        # one that holds the most PII while it is open -- so it clears on hide
+        # like the other two, with more at stake.
+        src/ComposeDialog.cpp
         # The tunnel settings window -- the s7 blocker. A window of its own for
         # the same reason as the one above: its own lifetime, its own state,
         # and a worker thread the Shell has no business owning.

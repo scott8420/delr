@@ -1,5 +1,6 @@
 #pragma once
 #include "AddCaseDialog.hpp"
+#include "ComposeDialog.hpp"
 #include "EgressDialog.hpp"
 #include "widgets/Widgets.hpp"
 #include "core/Broker.hpp"
@@ -74,6 +75,7 @@ private:
     void on_reload_roster();                  // category: handler: re-read the roster from disk
     void on_reload_cases();                   // category: handler: re-read the caseload from disk
     void on_reload_rules();                   // category: handler: re-read the page rules from disk
+    void on_reload_statutes();                // category: handler: re-read the law table from disk
     void on_reload_egress();                  // category: handler: re-read the tunnel policy
     void on_reload_profile();                 // category: handler: re-read the profile and repaint the form
     void on_save_profile();                   // category: handler: read the form, validate, write 0600
@@ -92,6 +94,12 @@ private:
     // built for its preflight -- a single job slot, the button insensitive
     // while it is occupied, the worker handed copies and touching no widget --
     // and it is copied rather than reinvented, as that header asked.
+    // Filing. Not work -- nothing leaves this machine on this path, which is
+    // the whole point of it, so it lives with the handlers and not with the
+    // thread.
+    void on_compose();                        // category: handler: open the request window
+    void on_request_filed(std::string case_id, core::Method channel);  // category: handler: the user says they sent it
+
     void on_check_now();                      // category: work: start a check
     void on_check_done();                     // category: work: apply what came back
     void start_check(const core::Case& k);    // category: work: fill the slot and go
@@ -105,6 +113,11 @@ private:
     // next time the action reported its state. One owner of "can this be
     // pressed", same rule as everywhere else in this codebase.
     void refresh_check_button();              // category: work: the one gate
+    // Its sibling, and gated differently ON PURPOSE: composing needs a
+    // selected case and nothing else. It opens no socket and needs no tunnel,
+    // and greying it out because the VPN is unconfigured would be the app
+    // refusing to draft a letter over a network setting the letter never uses.
+    void refresh_compose_button();
 
     // The check we decline to make. No thread and no socket: a funnel-only
     // broker has no listing page, so fetching costs the user a recorded visit
@@ -166,6 +179,10 @@ private:
     // `naked_exit` while open -- so it clears on hide, like the one above.
     EgressDialog m_egress_dialog;
 
+    // The request window. A member for the same reason as the two above, and
+    // the one with the strongest claim on "hiding clears" -- see its header.
+    ComposeDialog m_compose_dialog;
+
     // Body: sidebar | stack (each surface is a stack page).
     widgets::Box          m_body;
     widgets::StackSidebar m_sidebar;
@@ -202,6 +219,10 @@ private:
     // SELECTED row: one case checked deliberately, not a run.
     widgets::Box            m_check_row;
     widgets::Button         m_check_button;
+    // Its neighbour, and the second thing a user can do to a selected case.
+    // Beside the check rather than in the menu because the two are one
+    // errand: look at the listing, then ask them to take it down.
+    widgets::Button         m_compose_button;
     widgets::Reported       m_check_state;
     widgets::ScrolledWindow m_cases_scroll;
     widgets::ListBox        m_cases_list;
@@ -249,6 +270,11 @@ private:
     TermBox                 m_profile_places;
     widgets::Label          m_profile_year_caption;
     widgets::Entry          m_profile_year;
+    // The one field on this form that is not a search term. Every other box
+    // answers "is this page about me"; this one answers "may I demand this, or
+    // am I asking a favour" -- see `Profile::residency`.
+    widgets::Label          m_profile_residency_caption;
+    widgets::Entry          m_profile_residency;
 
     widgets::Box            m_profile_actions;
     widgets::Button         m_profile_save;
@@ -260,6 +286,10 @@ private:
     core::Roster    m_roster;
     core::Caseload  m_caseload;
     core::PageRules m_rules;
+    // The third asset. Loaded once at startup with the other two; the row that
+    // applies to this user is chosen by `Profile::residency` at compose time,
+    // not held as a member -- the profile can be edited while the app is up.
+    core::Statutes  m_statutes;
     // Loaded at startup, edited through the form, saved by the Shell -- the
     // same shape as the egress policy. It is the app's answer to "is this
     // listing mine", and until s14 that answer was always "cannot tell".
@@ -301,6 +331,7 @@ private:
 
     // Held because the check button's sensitivity lives here -- see above.
     Glib::RefPtr<Gio::SimpleAction> m_check_action;
+    Glib::RefPtr<Gio::SimpleAction> m_compose_action;
 
     // Loaded at startup, edited through the dialog, saved by the Shell. A
     // default-constructed policy refuses everything, so a first run with no

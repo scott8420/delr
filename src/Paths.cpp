@@ -47,6 +47,11 @@ std::string rules_file() {
     return join(asset_dir(), "pagerules.json");
 }
 
+std::string statutes_file() {
+    if (const char* e = env_or_null("DELR_STATUTES")) return e;
+    return join(asset_dir(), "statutes.json");
+}
+
 // ── state ───────────────────────────────────────────────────────────────────
 
 std::string state_dir() {

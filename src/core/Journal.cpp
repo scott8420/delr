@@ -21,6 +21,7 @@ const char* kind_name(Kind k) {
         case Kind::Checked:  return "checked";
         case Kind::Declined: return "declined";
         case Kind::Changed:  return "changed";
+        case Kind::Filed:    return "filed";
         case Kind::Other:    return "other";
     }
     return "other";
@@ -31,6 +32,7 @@ Kind kind_from(const std::string& s) {
     if (s == "checked")  return Kind::Checked;
     if (s == "declined") return Kind::Declined;
     if (s == "changed")  return Kind::Changed;
+    if (s == "filed")    return Kind::Filed;
     return Kind::Other;   // and the caller keeps the label. See the header.
 }
 
@@ -82,6 +84,18 @@ Entry entry_changed(const Case& k, Status from, Status to,
     return e;
 }
 
+Entry entry_filed(const Case& k, Method channel, const std::string& today) {
+    Entry e = base_of(k, Kind::Filed, today);
+    e.channel = channel;
+    // No outcome and no reason, for `entry_declined`'s reason turned around: a
+    // filing is not a look at anything, and borrowing an outcome to fill the
+    // field would make it read like one. The transition it usually causes --
+    // Found -> Requested -- is a SEPARATE `Changed` row, because the act and
+    // its consequence are two facts and the file's whole value is showing them
+    // as two.
+    return e;
+}
+
 std::string log_ref(const Entry& e) {
     return "entry:" + std::to_string(e.seq) + "/" + kind_name(e.kind) +
            "@" + e.case_id;
@@ -111,6 +125,11 @@ const Entry* journal_first(const Journal& j, const std::string& case_id, Kind k)
     for (const auto& e : j)
         if (e.case_id == case_id && e.kind == k) return &e;
     return nullptr;
+}
+
+std::string journal_filed_on(const Journal& j, const std::string& case_id) {
+    const Entry* e = journal_first(j, case_id, Kind::Filed);
+    return e ? e->date : std::string{};
 }
 
 std::vector<const Entry*> journal_since(const Journal& j, const std::string& iso) {
@@ -253,6 +272,16 @@ std::vector<std::string> journal_validate(const Journal& j) {
                     problems.push_back(ref + ": changed to what it already was");
                 break;
 
+            case Kind::Filed:
+                // A filing that cannot say how it went out cannot anchor a
+                // follow-up: "we wrote to them somehow" is not a fact a
+                // statutory complaint can be built on.
+                if (e.channel == Method::Unknown)
+                    problems.push_back(ref + ": filed without a channel");
+                if (e.outcome != Outcome::Never)
+                    problems.push_back(ref + ": filed carries an outcome");
+                break;
+
             case Kind::Opened:
                 break;
 
@@ -291,11 +320,18 @@ Entry decode(const json& o) {
     e.to         = status_from(o.value("to", "unknown"));
     e.provenance = provenance_from(o.value("provenance", "none"));
     e.other_id   = o.value("other_id", "");
+    e.channel    = method_from(o.value("channel", "unknown"));
     return e;
 }
 
-json encode(const Entry& e) {
-    json o;
+// `ordered_json` and not `json`, which is the whole of the difference: the
+// default object sorts its keys alphabetically, so every line led with
+// `broker_id` and buried `seq` and `date` in the middle. Harmless to a parser
+// and wrong for a file whose stated job is to be read by a human who does not
+// have the app -- found by reading the file at s16 and left for a session that
+// was not mid-test.
+nlohmann::ordered_json encode(const Entry& e) {
+    nlohmann::ordered_json o;
     o["seq"]  = e.seq;
     o["date"] = e.date;
     o["case_id"]   = e.case_id;
@@ -313,6 +349,7 @@ json encode(const Entry& e) {
     o["to"]         = status_name(e.to);
     o["provenance"] = provenance_name(e.provenance);
     o["other_id"]   = e.other_id;
+    o["channel"]    = method_name(e.channel);
     return o;
 }
 

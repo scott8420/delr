@@ -154,7 +154,14 @@ void Shell::build_pages() {
     m_check_row.set_margin_start(8);
     m_check_row.set_margin_end(8);
     m_check_row.set_margin_bottom(8);
+    m_compose_button.set_label("Compose request");
+    m_compose_button.set_tooltip_text(
+        "Draft an opt-out request for the selected listing. delr does not "
+        "send it.");
+    m_compose_button.set_action_name("win.compose");
+
     m_check_row.append(m_check_button);
+    m_check_row.append(m_compose_button);
     m_check_row.append(m_check_state);
 
     // Selection exists so the button has something to act on. SINGLE rather
@@ -301,6 +308,22 @@ void Shell::build_profile_page() {
     m_profile_year.set_hexpand(false);
     m_profile_year.set_halign(Gtk::Align::START);
 
+    // ── Where you live ──────────────────────────────────────────────────────
+    // Not a search term, and the caption says so, because a user who reads
+    // this form top to bottom has been answering "what should delr look for"
+    // eight times in a row and this box is a different question.
+    m_profile_residency_caption.set_markup(
+        "<b>Where you live</b>  <span size=\"small\">two-letter state — this is "
+        "not a search term. It decides which law delr may invoke on your "
+        "behalf, and blank means it invokes none.</span>");
+    m_profile_residency_caption.set_xalign(0.0f);
+    m_profile_residency_caption.set_wrap(true);
+    m_profile_residency_caption.set_margin_top(8);
+    m_profile_residency.set_placeholder_text("TN");
+    m_profile_residency.set_max_width_chars(8);
+    m_profile_residency.set_hexpand(false);
+    m_profile_residency.set_halign(Gtk::Align::START);
+
     m_profile_form.set_margin_start(12);
     m_profile_form.set_margin_end(12);
     m_profile_form.set_margin_bottom(12);
@@ -320,6 +343,8 @@ void Shell::build_profile_page() {
     m_profile_form.append(m_profile_places.scroll);
     m_profile_form.append(m_profile_year_caption);
     m_profile_form.append(m_profile_year);
+    m_profile_form.append(m_profile_residency_caption);
+    m_profile_form.append(m_profile_residency);
 
     m_profile_scroll.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
     m_profile_scroll.set_child(m_profile_form);
@@ -365,12 +390,13 @@ Glib::RefPtr<Gio::Menu> Shell::build_menu() {
     config->append("Tunnel and privacy...", "win.egress");
     menu->append_section({}, config);
 
-    // Reloads read the three tables back off disk. They are here because the
+    // Reloads read the tables back off disk. They are here because the
     // tables are editable files by design and someone will edit one.
     auto reload = Gio::Menu::create();
     reload->append("Reload cases",      "win.reload-cases");
     reload->append("Reload roster",     "win.reload-roster");
     reload->append("Reload page rules", "win.reload-rules");
+    reload->append("Reload statutes",   "win.reload-statutes");
     reload->append("Reload profile",    "win.reload-profile");
     menu->append_section({}, reload);
 

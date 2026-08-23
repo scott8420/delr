@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "core/Broker.hpp"   // Method -- the channel a request went out on
 #include "core/Case.hpp"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +105,18 @@ enum class Kind {
     Checked,  // a fetch ran and was judged -- carries outcome and reason
     Declined, // NO fetch was attempted, and why -- carries reason
     Changed,  // the case's standing moved -- carries from, to, provenance
+    // The user says they sent the request -- carries the channel it went out
+    // on. Predicted by this file's own header at s16 as "the obvious next
+    // one", which is why the forward-tolerance path was built before there
+    // was anything to exercise it: an s16 binary reading an s17 journal gives
+    // these rows back unchanged instead of deleting somebody's proof.
+    //
+    // Not the app's claim. delr does not send, so it cannot witness a send;
+    // this row records that A PERSON SAID SO, and it is written at the moment
+    // they say it rather than inferred from anything observed. That is a
+    // weaker fact than a `Checked` and the file is honest about the
+    // difference by keeping them apart.
+    Filed,
     Other     // written by a newer delr; label preserved in `kind_raw`
 };
 
@@ -149,6 +162,15 @@ struct Entry {
     Status     to         = Status::Unknown;
     Provenance provenance = Provenance::None;
 
+    // Filed: which way the request actually went out. `Method` rather than a
+    // second enum of the same shape, because the channel IS a broker method
+    // and two parallel enums drift the first time one of them gains a value.
+    //
+    // Recorded AS USED, not as declared: a user who gave up on the web form
+    // and mailed the privacy address has filed by email, and the roster's
+    // column does not get to overrule what happened.
+    Method channel = Method::Unknown;
+
     // The successor's id on a relist. The one place an entry points at another
     // case, and it is here rather than in a second entry because a relist is
     // ONE event about two rows -- the same reason `caseload_record_return`
@@ -185,6 +207,14 @@ Entry entry_changed(const Case& k, Status from, Status to,
                     const std::string& today,
                     const std::string& other_id = "");
 
+// The request went out. Carries the channel and nothing about the request's
+// CONTENTS -- see `core/Compose`: the composed text is the most PII-dense
+// string this program produces and it is never persisted anywhere, here least
+// of all. What the journal is for is the date and the fact, which are exactly
+// what a statutory follow-up needs and exactly what the user's own sent-mail
+// folder is bad at proving to a third party.
+Entry entry_filed(const Case& k, Method channel, const std::string& today);
+
 // Safe log identifier -- "entry:<seq>/<kind>@<case_id>". No dates, no
 // transition, no broker. Anything that logs an entry logs THIS.
 std::string log_ref(const Entry& e);
@@ -205,6 +235,14 @@ const Entry* journal_last(const Journal& j, const std::string& case_id, Kind k);
 // this once filing exists -- a statutory deadline runs from when the request
 // went out, not from the last time anyone touched the case.
 const Entry* journal_first(const Journal& j, const std::string& case_id, Kind k);
+
+// The date the FIRST request for this case went out, or empty when none has.
+// The anchor a statutory deadline runs from, and it lives here rather than on
+// `Case::requested` for the reason the whole table exists: `requested` is a
+// mutable field that a later act can overwrite, and a deadline measured from a
+// value that can move is not a deadline. `journal_first(..., Kind::Filed)` is
+// the general form; this is the one callers actually want.
+std::string journal_filed_on(const Journal& j, const std::string& case_id);
 
 // Everything on or after `iso`, in order. Empty or invalid date yields empty
 // rather than everything: a malformed filter that silently means "no filter"
@@ -262,6 +300,7 @@ Tally journal_tally(const Journal& j, const std::string& case_id = "");
 //   - Indeterminate carries a reason; every other outcome carries none
 //   - Declined carries a reason
 //   - Changed carries a real transition (from != to)
+//   - Filed carries a channel, and carries no outcome
 //   - Other carries its raw label, or the entry is unrecoverable
 std::vector<std::string> journal_validate(const Journal& j);
 

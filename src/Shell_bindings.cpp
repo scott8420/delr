@@ -8,6 +8,7 @@ void Shell::bind_actions() {
     add_action("reload-roster", sigc::mem_fun(*this, &Shell::on_reload_roster));
     add_action("reload-cases",  sigc::mem_fun(*this, &Shell::on_reload_cases));
     add_action("reload-rules",  sigc::mem_fun(*this, &Shell::on_reload_rules));
+    add_action("reload-statutes", sigc::mem_fun(*this, &Shell::on_reload_statutes));
     add_action("reload-profile",sigc::mem_fun(*this, &Shell::on_reload_profile));
     add_action("save-profile",  sigc::mem_fun(*this, &Shell::on_save_profile));
     // Kept, rather than fired and forgotten: this action is the check
@@ -15,6 +16,11 @@ void Shell::bind_actions() {
     m_check_action =
         add_action("check-now", sigc::mem_fun(*this, &Shell::on_check_now));
     m_check_action->set_enabled(false);   // nothing selected, no policy read yet
+    // Kept for the same reason and gated more loosely: a selected case is all
+    // it needs. See `refresh_compose_button`.
+    m_compose_action =
+        add_action("compose", sigc::mem_fun(*this, &Shell::on_compose));
+    m_compose_action->set_enabled(false);
     add_action("egress",        sigc::mem_fun(*this, &Shell::on_egress_settings));
     add_action("dump-registry", sigc::mem_fun(*this, &Shell::on_dump_registry));
     add_action("quit",          sigc::mem_fun(*this, &Shell::on_quit));
@@ -29,6 +35,11 @@ void Shell::bind_actions() {
     // Shell owns the path and the pump.
     m_egress_dialog.signal_saved().connect(
         sigc::mem_fun(*this, &Shell::on_egress_saved));
+
+    // Third instance of the same seam: the window drafts, the user sends, and
+    // the Shell is what writes down that they said they did.
+    m_compose_dialog.signal_filed().connect(
+        sigc::mem_fun(*this, &Shell::on_request_filed));
 
     // The check's two wires. The row selection decides WHICH case the button
     // acts on, so picking a row is what turns the button on; the dispatcher is

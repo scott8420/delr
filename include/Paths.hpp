@@ -53,6 +53,15 @@ std::string asset_dir();
 std::string roster_file();
 std::string rules_file();
 
+// `DELR_STATUTES` wins outright, else the file inside `asset_dir`.
+//
+// The third asset, and the first one that is about the USER'S rights rather
+// than about a broker or a page. Still an asset and not state: the law is the
+// same on every machine in a jurisdiction, and WHICH row applies to this user
+// is the one bit that is personal -- and that bit lives on the profile, which
+// is state, 0600, and never in the tree.
+std::string statutes_file();
+
 // ── state ───────────────────────────────────────────────────────────────────
 
 // `DELR_STATE`, else `$XDG_DATA_HOME/delr`, else `$HOME/.local/share/delr`.

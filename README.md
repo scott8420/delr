@@ -17,6 +17,13 @@ you out), **cases** (what you've asked, when, and where it stands), and your
 **profile** (the identifiers a request is made against). Everything else is a
 view over those.
 
+Except one thing, and it's the thing they don't keep: a **journal**. A case
+holds the *last* check and every new one overwrites it, which is a snapshot
+wearing a record's clothes. Ask a removal service how many times it looked, or
+how long a broker has been refusing you, and it has no answer because it never
+wrote one down. `journal.ndjson` -- under your state directory, append-only,
+one line per act, never rewritten -- is where delr writes it down.
+
 The part nobody does is verification. A removal service reports its own
 success; California's DROP platform reports what the broker self-declares.
 Neither goes back to look at the live page in ninety days, and re-listing is
@@ -97,7 +104,7 @@ Stub. What exists and is exercised:
 | The check, wired to a button: preflight, fetch, read the page, record it | `src/Shell_work.cpp` | compiles; **unverified visually** |
 | The maintenance queue -- listings fetched and not readable | `src/Shell_handlers.cpp` | compiles; **unverified visually** |
 | Follows the desktop light/dark preference | `include/Appearance.hpp`, `src/Appearance.cpp` | working |
-| Core checks (`delr --selftest`) | `src/selftest.cpp` | 772 pass / 0 fail, run on demand |
+| Core checks (`delr --selftest`) | `src/selftest.cpp` | 907 pass / 0 fail, run on demand |
 | One real preflight, printing no addresses (`delr --netcheck [wg0]`) | `src/netcheck.cpp` | works, against the saved policy or an ad-hoc one |
 | Tunnel settings: interface, lookups, proxy, trusted exits, baseline, preflight | `include/EgressDialog.hpp`, `src/EgressDialog.cpp` | compiles; **unverified visually** |
 | App shell, sidebar + stack, roster page | `src/Shell*.cpp` | compiles; **unverified visually** |
@@ -111,8 +118,8 @@ other, and only the case where both agree counts as working.
 ## Next
 
 Opt-out filing by email, which the registry makes the primary
-channel · a journal that says loudly when nothing has run · scheduled runs over
-the whole due queue, rate limited between brokers.
+channel · scheduled runs over the whole due queue, rate limited between
+brokers, appending to the journal without a human present.
 
 **The roster is 543 registrants; it is not 543 checkable listings.** California
 compels the list, so the roster is now complete and current on who holds data and

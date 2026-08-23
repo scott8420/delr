@@ -211,6 +211,12 @@ std::string date_add_days(const std::string& iso, int days) {
     return fmt_iso(y, m, d);
 }
 
+int date_days_between(const std::string& a, const std::string& b) {
+    int ya, yb; unsigned ma, da, mb, db;
+    if (!parse_iso(a, ya, ma, da) || !parse_iso(b, yb, mb, db)) return 0;
+    return static_cast<int>(days_from_civil(yb, mb, db) - days_from_civil(ya, ma, da));
+}
+
 int date_compare(const std::string& a, const std::string& b) {
     const bool va = date_valid(a), vb = date_valid(b);
     if (!va && !vb) return 0;

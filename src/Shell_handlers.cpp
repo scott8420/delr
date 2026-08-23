@@ -355,10 +355,19 @@ void Shell::on_case_committed(core::Case fresh) {
     if (lg) lg->info("intake: committed {}, caseload now {} case(s)",
                      core::log_ref(fresh), m_caseload.size());
 
+    // The history's first line about this listing. Written AFTER the caseload
+    // saved, deliberately: an "opened" entry for a case that never made it to
+    // disk would be the journal claiming something the app cannot show.
+    core::Entry opened = core::entry_opened(fresh, today());
+    std::string note;
+    if (!record_entry(opened))
+        note = "  (Added, but the history could not be written -- see the log.)";
+
     // Repaint FROM DISK rather than from memory: the reload proves the write
     // round-tripped, and the trace and the window then agree by construction
     // instead of by assumption.
     on_reload_cases();
+    if (!note.empty()) m_cases_status.set_text(m_cases_status.get_text() + note);
     m_stack.set_visible_child(m_cases_page);
 }
 
@@ -373,6 +382,28 @@ void Shell::on_case_committed(core::Case fresh) {
 // empty means there is no home to write to, which is a refusal rather than
 // something to paper over with the working directory.
 std::string Shell::egress_file() const  { return paths::egress_file(); }
+
+// ── The run history ──────────────────────────────────────────────────────────
+
+std::string Shell::journal_file() const { return paths::journal_file(); }
+
+bool Shell::record_entry(core::Entry& e) {
+    const std::string file = journal_file();
+    if (file.empty()) return false;   // no state dir: paths refused, not us
+
+    std::error_code ec;
+    std::filesystem::create_directories(Glib::path_get_dirname(file), ec);
+
+    if (!core::journal_record(file, e)) {
+        auto lg = log::get(log::Area::Cases);
+        // The entry itself never reaches the log -- `core::log_ref(Entry)`
+        // carries a seq, a kind and a case id and nothing else, which is the
+        // same discipline every other write in this program observes.
+        if (lg) lg->error("journal: {} could not be written", core::log_ref(e));
+        return false;
+    }
+    return true;
+}
 std::string Shell::profile_file() const { return paths::profile_file(); }
 
 // ─────────────────────────────────────────────────────────────────────────────

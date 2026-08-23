@@ -139,6 +139,17 @@ std::string date_add_days(const std::string& iso, int days);
 // <0, 0, >0. Invalid dates sort before valid ones rather than throwing.
 int date_compare(const std::string& a, const std::string& b);
 
+// Days from `a` to `b`, calendar-correct and signed. Either invalid yields 0,
+// which is the same never-a-silently-wrong-answer contract `date_add_days`
+// keeps -- a caller that wants to tell "same day" from "could not tell" checks
+// `date_valid` first, and every caller that does not is asking a question a
+// zero answers safely.
+//
+// Exists because the run history asks a question the schedule never did: the
+// caseload only ever needed "is this due yet", which `date_compare` answers,
+// while "how long has this broker been refusing you" needs a duration.
+int date_days_between(const std::string& a, const std::string& b);
+
 struct Case {
     std::string id;          // stable slug, unique within the caseload
     std::string broker_id;   // -> Broker::id in the roster

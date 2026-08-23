@@ -116,6 +116,61 @@ void Shell::on_check_now() {
 // one slot, the button insensitive while it is occupied, the worker handed
 // copies and touching no widget. If a third caller ever wants it, lift it out
 // rather than writing it a third time.
+// ── Declining, which is a result and not an absence ──────────────────────────
+// No thread, no socket, no round trip. The case is recorded as indeterminate
+// with a reason the same way a failed fetch would be -- fail closed applies to
+// a fetch we chose not to make exactly as much as to one that came back a wall
+// -- and the journal gets a `Declined` line saying nothing left this machine.
+void Shell::decline_check(const core::Case& k, core::Reason r) {
+    auto lg = log::get(log::Area::Cases);
+
+    std::size_t at = m_caseload.size();
+    for (std::size_t i = 0; i < m_caseload.size(); ++i)
+        if (m_caseload[i].id == k.id) { at = i; break; }
+    if (at == m_caseload.size()) return;
+
+    // Tomorrow rather than in 45 days would be wrong here: unlike a tunnel
+    // outage this is not going to resolve itself overnight. `NoListingPage` is
+    // nobody's to fix, so the broker's own rhythm is the honest cadence.
+    const auto* b = core::roster_find(m_roster, m_caseload[at].broker_id);
+    const int recheck = b ? b->recheck_days : 45;
+    const std::string who = b ? b->name : m_caseload[at].broker_id;
+
+    m_caseload[at] = core::apply_check(m_caseload[at], core::Outcome::Indeterminate,
+                                       r, today(), recheck);
+    // Not the broker being difficult and not a rule that rotted -- there is no
+    // page. A streak here would argue a live case toward Abandoned on the
+    // strength of the broker's site design, which is the same mistake s15
+    // stopped the attributed walls from making.
+    m_caseload[at].consecutive_failures = 0;
+
+    core::Entry declined = core::entry_declined(m_caseload[at], r, today());
+    const bool kept = record_entry(declined);
+
+    if (lg) lg->info("check: case:{} declined -> {}/{}", k.id,
+                     core::outcome_name(m_caseload[at].outcome),
+                     core::reason_name(m_caseload[at].reason));
+
+    const std::string file = cases_file();
+    std::error_code ec;
+    std::filesystem::create_directories(Glib::path_get_dirname(file), ec);
+    if (!core::caseload_save(file, m_caseload)) {
+        if (lg) lg->error("check: save failed");
+        m_check_state.set_text(who +
+            ": nothing was sent, and the result could NOT be saved -- see the log.");
+        refresh_check_button();
+        return;
+    }
+
+    on_reload_cases();
+    m_check_state.set_text(
+        who + " publishes no stable listing page, only a lead-capture funnel. "
+              "Nothing was sent -- checking one would cost you a visit from your "
+              "exit address and tell us nothing." +
+        std::string(kept ? "" :
+            "  (The history could not be written -- see the log.)"));
+}
+
 void Shell::start_check(const core::Case& k) {
     if (checking()) return;
     if (m_check_worker.joinable()) m_check_worker.join();   // the previous, finished
@@ -134,6 +189,23 @@ void Shell::start_check(const core::Case& k) {
     const core::PageRule* rule = core::rules_find(m_rules, k.broker_id);
     m_job_has_rule = (rule != nullptr);
     m_job_rule     = rule ? *rule : core::PageRule{};
+
+    // ── The fetch we refuse to make ──────────────────────────────────────────
+    // s15 built `rule_verifiable` and said the caller consults it BEFORE
+    // fetching, and then the caller did not. A funnel-only broker publishes no
+    // stable per-person page: fetching one hands them a recorded visit from
+    // the user's exit address and returns nothing about the listing. The worst
+    // trade in the program, and until this line the app was still making it.
+    //
+    // Recorded as `Declined` rather than a check that failed, because the
+    // distinction the journal exists to keep is whether the broker was
+    // contacted at all.
+    if (!core::rule_verifiable(m_job_has_rule ? &m_job_rule : nullptr)) {
+        m_job_url.clear();
+        m_job_needles = core::PageNeedles{};
+        decline_check(k, core::Reason::NoListingPage);
+        return;
+    }
 
     m_job_obs     = core::EgressObservation{};
     m_job_verdict = core::Verdict::Unconfigured;
@@ -208,6 +280,10 @@ void Shell::on_check_done() {
     // the schema's own default rather than a number invented here.
     const int recheck = b ? b->recheck_days : 45;
 
+    // The standing BEFORE anything below moves it. A transition needs both
+    // ends, and after `apply_promotion` has run there is only one left to read.
+    const core::Status was = m_caseload[at].status;
+
     std::string said;
     if (m_job_ours) {
         // Not a check. `apply_egress_refusal` records Indeterminate/NoTunnel,
@@ -227,12 +303,40 @@ void Shell::on_check_done() {
     // `apply_*` above recorded what was SEEN. This is the judgment about what
     // to believe, and it is `promotion_for`'s, made from what is now on the
     // case rather than from what this check happened to see.
+    // ── The history, written before the belief ───────────────────────────────
+    // What the fetch SAW goes down first and separately from what the app
+    // decided it MEANS, because those are two acts and the journal's whole
+    // value is that it can show them as two. A reader six months from now
+    // should be able to see the two clean absences AND the promotion they
+    // caused, rather than a single row asserting a removal.
+    //
+    // `Declined` when nothing left this machine -- an egress refusal is our
+    // outage, not a look at the broker. `Checked` otherwise, even when the far
+    // end walled us: a wall is something the broker DID, and recording it as a
+    // non-event would lose the very run of refusals `journal_walled_since`
+    // exists to measure.
+    bool kept = true;
+    if (m_job_ours) {
+        core::Entry e = core::entry_declined(m_caseload[at],
+                                             m_caseload[at].reason, today());
+        kept = record_entry(e);
+    } else {
+        core::Entry e = core::entry_checked(m_caseload[at], today());
+        kept = record_entry(e);
+    }
+
     std::string news;
     const core::Promotion prom = core::promotion_for(m_caseload[at]);
     if (prom == core::Promotion::Removed) {
         m_caseload[at] = core::apply_promotion(m_caseload[at]);
         news = "  Believed removed — on our own fetch of the live page, not on "
                "anyone's claim.";
+        // A second line, not an amended first one. The check that triggered
+        // this is already on the record and does not get rewritten to say it
+        // meant more than it said at the time.
+        core::Entry e = core::entry_changed(m_caseload[at], was,
+                                            m_caseload[at].status, today());
+        if (!record_entry(e)) kept = false;
     } else if (prom == core::Promotion::Returned) {
         // The event the whole app exists to catch. Two rows, never an edit:
         // the old case ends at Relisted and a successor opens, and
@@ -245,6 +349,24 @@ void Shell::on_check_done() {
                    fresh_id + " has been opened in its place.";
             if (lg) lg->warn("check: {} relisted, successor {}",
                              m_job_case_id, fresh_id);
+
+            // The event this app exists to catch, and therefore the one entry
+            // in the file that most needs to be there. Two caseload rows, ONE
+            // journal line -- a relist is a single event about two cases, and
+            // `other_id` is what keeps it from being counted twice.
+            const core::Case* closed = core::caseload_find(m_caseload, m_job_case_id);
+            if (closed) {
+                core::Entry e = core::entry_changed(*closed, was,
+                                                    core::Status::Relisted,
+                                                    today(), fresh_id);
+                if (!record_entry(e)) kept = false;
+            }
+            // The successor's own history starts here, so its first line is
+            // not a check against a case the file has never seen opened.
+            if (const core::Case* fresh = core::caseload_find(m_caseload, fresh_id)) {
+                core::Entry o = core::entry_opened(*fresh, today());
+                if (!record_entry(o)) kept = false;
+            }
         }
     }
 
@@ -279,7 +401,39 @@ void Shell::on_check_done() {
     // by assumption. It also restores the selection, so the same case can be
     // checked again without hunting for it.
     on_reload_cases();
-    m_check_state.set_text(who + ": " + said + news);
+    // ── The sentence only a history can produce ──────────────────────────────
+    // `Case` knows this listing is walled and knows how many failures have
+    // stacked up. It cannot say SINCE WHEN, because it holds one check and
+    // this is the second, or the ninth. The journal can, and the difference is
+    // between a user shrugging at a red row and a user knowing that Spokeo has
+    // refused this machine since March -- or, when the wall is `ClientBlocked`,
+    // knowing it is ours to fix and not worth them touching at all.
+    std::string history;
+    if (m_caseload[at].outcome == core::Outcome::Indeterminate &&
+        core::reason_is_wall(m_caseload[at].reason)) {
+        const core::Journal j = core::journal_load(journal_file());
+        const std::string since = core::journal_walled_since(j, m_job_case_id);
+        // Only from the second wall on. "Refusing us since today" is a
+        // sentence with no information in it, and printing it would teach the
+        // user to skip the line that will matter on the ninth check.
+        const int days = core::date_days_between(since, today());
+        if (!since.empty() && days > 0) {
+            history = "  This wall has been up for " + std::to_string(days) +
+                      " day" + (days == 1 ? "" : "s") + ", since " + since + ".";
+            if (m_caseload[at].reason == core::Reason::ClientBlocked)
+                history += "  That is ours to fix, not yours — changing exits "
+                           "will not help.";
+            else if (m_caseload[at].reason == core::Reason::EgressBlocked)
+                history += "  A different exit, or a different city, is the "
+                           "thing to try.";
+        }
+    }
+
+    // The result saved; only the record of it did not. Said out loud rather
+    // than swallowed: an app whose entire pitch is that it keeps the history
+    // nobody else keeps does not get to lose a line quietly.
+    m_check_state.set_text(who + ": " + said + news + history +
+        (kept ? "" : "  (The history could not be written — see the log.)"));
 }
 
 }  // namespace delr

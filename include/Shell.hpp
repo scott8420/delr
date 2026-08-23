@@ -6,6 +6,7 @@
 #include "core/Case.hpp"
 #include "core/Egress.hpp"
 #include "core/Intake.hpp"
+#include "core/Journal.hpp"
 #include "core/PageRules.hpp"
 #include "core/Profile.hpp"
 #include "net/Fetch.hpp"
@@ -105,6 +106,12 @@ private:
     // pressed", same rule as everywhere else in this codebase.
     void refresh_check_button();              // category: work: the one gate
 
+    // The check we decline to make. No thread and no socket: a funnel-only
+    // broker has no listing page, so fetching costs the user a recorded visit
+    // from their exit and returns nothing. Records the case and the journal
+    // line on the main thread and comes straight back.
+    void decline_check(const core::Case& k, core::Reason r);
+
     // Where the JSON lives. UI-side path resolution -- the core takes a plain
     // string and stays free of GTK (the seam).
     std::string roster_file() const;
@@ -118,6 +125,22 @@ private:
     std::string egress_file() const;
     // The person. Mode 0600, under state, never in the tree -- see its pump.
     std::string profile_file() const;
+    // The run history. The only state file that GROWS -- appended to, never
+    // rewritten -- which is why its loss is the one that cannot be undone.
+    std::string journal_file() const;
+
+    // Write one entry, and NEVER fail the user's action over it.
+    //
+    // The caseload is authoritative about the present and the journal is
+    // authoritative about the past, so a journal that will not write is a lost
+    // record and not a lost result -- the check still happened and still
+    // saved. Blocking the save on it would trade the thing the user asked for
+    // against the record of having done it, which is the wrong way round.
+    //
+    // But it is not silent either. A privacy tool whose whole pitch is that it
+    // keeps the history nobody else keeps does not get to drop history
+    // quietly: false here puts a sentence on screen as well as in the log.
+    bool record_entry(core::Entry& e);
 
     // Today, as ISO "YYYY-MM-DD". Also UI-side, and for the same reason: the
     // core does date ARITHMETIC but never asks what day it is. A pure function

@@ -8,6 +8,8 @@ void Shell::bind_actions() {
     add_action("reload-roster", sigc::mem_fun(*this, &Shell::on_reload_roster));
     add_action("reload-cases",  sigc::mem_fun(*this, &Shell::on_reload_cases));
     add_action("reload-rules",  sigc::mem_fun(*this, &Shell::on_reload_rules));
+    add_action("reload-profile",sigc::mem_fun(*this, &Shell::on_reload_profile));
+    add_action("save-profile",  sigc::mem_fun(*this, &Shell::on_save_profile));
     // Kept, rather than fired and forgotten: this action is the check
     // button's enabled state, and `refresh_check_button` turns it on and off.
     m_check_action =
@@ -54,6 +56,8 @@ void Shell::bind_actions() {
         app->set_accels_for_action("win.add-case",   {"<Control>n"});
         app->set_accels_for_action("win.check-now",  {"<Control>Return"});
         app->set_accels_for_action("win.egress",     {"<Control>comma"});
+        // The one key everybody already knows means "write what I typed".
+        app->set_accels_for_action("win.save-profile", {"<Control>s"});
         // The caseload is the table a user edits by hand; the other two get
         // the same key with a modifier rather than three unrelated keys.
         app->set_accels_for_action("win.reload-cases",  {"F5"});

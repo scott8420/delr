@@ -165,6 +165,14 @@ const PageRule* rules_find(const PageRules& r, const std::string& broker_id) {
     return nullptr;
 }
 
+bool rule_verifiable(const PageRule* r) {
+    // A null rule is verifiable. No rule means we cannot READ the page, which
+    // is a maintainer's problem; funnel_only means there is no page to read,
+    // which is nobody's. Collapsing them would put a broker that can never be
+    // checked into the queue of brokers waiting for someone to write a rule.
+    return !r || !r->funnel_only;
+}
+
 int rule_age_days(const PageRule& r, const std::string& today) {
     if (!date_valid(r.reviewed) || !date_valid(today)) return -1;
     // No day-count primitive in Case; walking is fine at this scale and reuses
@@ -216,9 +224,26 @@ std::vector<std::string> rules_validate(const PageRules& r, const Roster* roster
         if (roster && !p.broker_id.empty() && !roster_find(*roster, p.broker_id))
             problems.push_back(who + ": no such broker in the roster");
 
-        check_list(who, "fingerprint", p.fingerprint);
-        check_list(who, "present", p.present);
-        check_list(who, "absent", p.absent);
+        // A funnel-only rule carries one fact and no markers. Demanding a
+        // fingerprint for a page that does not exist would force a maintainer
+        // to invent one, and an invented marker is worse than an absent one --
+        // it will match something, eventually, and produce a verdict about a
+        // listing nobody ever published. Markers ARE still checked when
+        // present, so a rule that was funnel-only and stops being one does not
+        // smuggle junk through on the way back.
+        if (!p.funnel_only) {
+            check_list(who, "fingerprint", p.fingerprint);
+            check_list(who, "present", p.present);
+            check_list(who, "absent", p.absent);
+        } else {
+            if (p.needs_needle)
+                problems.push_back(who + ": funnel_only and needs_needle "
+                                         "together -- there is no page to find "
+                                         "needles on");
+            if (!p.fingerprint.empty() || !p.present.empty() || !p.absent.empty())
+                problems.push_back(who + ": funnel_only rule carries markers "
+                                         "that will never run");
+        }
 
         // A string in both lists guarantees Ambiguous on every fetch, which is
         // a rule that refuses forever while looking configured.
@@ -254,6 +279,9 @@ const char* page_verdict_name(PageVerdict v) {
         case PageVerdict::HttpThrottled:   return "http-throttled";
         case PageVerdict::HttpServerError: return "http-server-error";
         case PageVerdict::HttpUnexpected:  return "http-unexpected";
+        case PageVerdict::HttpBlockedEgress: return "http-blocked-egress";
+        case PageVerdict::HttpBlockedClient: return "http-blocked-client";
+        case PageVerdict::FunnelOnly:        return "funnel-only";
     }
     return "silent";
 }
@@ -298,6 +326,23 @@ const char* page_verdict_text(PageVerdict v) {
             return "The site failed on its own end. Worth retrying later.";
         case PageVerdict::HttpUnexpected:
             return "The site answered in a way the check does not understand.";
+
+        // The three sentences this whole stone exists to produce. Each one
+        // names who can act, because that is the only thing a person reading a
+        // refusal actually needs to know.
+        case PageVerdict::HttpBlockedEgress:
+            return "The site refused the address the check came from. It blocks "
+                   "VPN and datacenter traffic. A different exit, or a different "
+                   "city on the same one, may get through.";
+        case PageVerdict::HttpBlockedClient:
+            return "The site refused the check itself, not the address -- it "
+                   "wants a real browser. The same page opens normally through "
+                   "the same tunnel. This one is ours to fix, not yours.";
+        case PageVerdict::FunnelOnly:
+            return "This broker publishes no page to check. Results are "
+                   "assembled behind a form and never live at a fixed address, "
+                   "so no fetch can confirm a removal here. Filing is the only "
+                   "lever on this one.";
     }
     return "The page could not be read.";
 }
@@ -309,12 +354,22 @@ bool page_verdict_is_clean(PageVerdict v) {
 
 PageVerdict page_check(const PageRule* rule, int status, const std::string& body,
                        const PageNeedles& needles) {
+    // 0. Is there anything here to check. Declared by a human, not observed --
+    //    a funnel-only broker answers 200 with a plausible page and still has
+    //    no listing at this address. It is checked FIRST, before the status,
+    //    because whatever came back is irrelevant: the caller should not have
+    //    fetched at all (`rule_verifiable`), and if it did, the response is not
+    //    evidence about a listing that was never published.
+    if (rule && rule->funnel_only) return PageVerdict::FunnelOnly;
+
     // 1. The status. A 403's body belongs to the bot wall, and running a
     //    broker's markers over someone else's page is how a wall becomes a
-    //    removal.
+    //    removal. It is still read -- by `refusal_attribute`, and only about
+    //    ITSELF. The wall is a bad witness about the listing and a good one
+    //    about what it just refused.
     if (status <= 0)                    return PageVerdict::NoResponse;
     if (status == 404 || status == 410) return PageVerdict::HttpDead;
-    if (status == 401 || status == 403) return PageVerdict::HttpBlocked;
+    if (status == 401 || status == 403) return refusal_attribute(body);
     if (status == 429)                  return PageVerdict::HttpThrottled;
     if (status >= 500)                  return PageVerdict::HttpServerError;
     if (status != 200)                  return PageVerdict::HttpUnexpected;
@@ -366,6 +421,99 @@ PageVerdict page_check(const PageRule* rule, int status, const std::string& body
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Reading the wall's own words
+//
+// Two closed phrase sets, normalised through `page_text` like every other
+// marker in this file. Substring matching only: this body arrives from a
+// hostile network and a regex over it is an attack surface.
+//
+// Choosing what goes in these lists is the whole design, and the rule is: a
+// phrase earns its place only if a wall would print it ABOUT THE THING IT
+// REFUSED. Generic anger ("access denied", "forbidden", "request blocked")
+// appears on both kinds of wall and is therefore worthless here -- it is
+// exactly what plain `HttpBlocked` already means. What distinguishes them is
+// the noun: an address wall talks about addresses and networks, a client wall
+// talks about browsers and scripts.
+//
+// Both lists are short on purpose and should stay short. A miss costs one
+// unattributed `Blocked`, which is the honest default anyway. A false hit
+// sends the user to change VPN exits over a User-Agent header, or tells them
+// to sit tight waiting for a fix while a wall they could have walked around
+// keeps refusing them. The asymmetry says: when unsure, leave it out.
+//
+// Deliberately NOT a list of vendor names. Naming the three big bot-defence
+// products would rot on the next rebrand and would teach the app to recognise
+// companies rather than sentences. Walls that must explain themselves to a
+// human converge on the same dozen words whoever built them.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+// The wall refused WHERE the request came from. The user can act on this today.
+const char* const kEgressPhrases[] = {
+    "vpn",
+    "proxy",
+    "datacenter",
+    "data center",
+    "hosting provider",
+    "anonymiser",
+    "anonymizer",
+    "your ip address",
+    "this ip address",
+    "ip address has been blocked",
+    "not available in your country",
+    "not available in your region",
+    "unavailable in your location",
+};
+
+// The wall refused WHAT made the request. Ours to fix; the user cannot.
+const char* const kClientPhrases[] = {
+    "enable javascript",
+    "javascript is required",
+    "javascript to continue",
+    "requires javascript",
+    "supports javascript",
+    "browser check",
+    "checking your browser",
+    "verify you are human",
+    "are you a robot",
+    "confirm you are not a robot",
+    "human verification",
+    "automated traffic",
+    "automated requests",
+    "unusual traffic",
+    "bot detected",
+    "enable cookies",
+    "cookies are required",
+};
+
+bool any_phrase(const std::string& text, const char* const* set, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i)
+        if (page_contains(text, set[i])) return true;
+    return false;
+}
+
+}  // namespace
+
+PageVerdict refusal_attribute(const std::string& body) {
+    const std::string text = page_text(body);
+    if (text.empty()) return PageVerdict::HttpBlocked;
+
+    const bool egress = any_phrase(text, kEgressPhrases,
+                                   sizeof(kEgressPhrases) / sizeof(*kEgressPhrases));
+    const bool client = any_phrase(text, kClientPhrases,
+                                   sizeof(kClientPhrases) / sizeof(*kClientPhrases));
+
+    // Both fired, or neither. Not a precedence call -- the same refusal as
+    // `Ambiguous`, for the same reason: a wall that talks about VPNs AND about
+    // browsers has told us it is a wall and nothing more, and picking the
+    // louder list would be inventing a diagnosis out of word counts.
+    // Unattributed is the truth.
+    if (egress == client) return PageVerdict::HttpBlocked;
+
+    return egress ? PageVerdict::HttpBlockedEgress : PageVerdict::HttpBlockedClient;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The seam to the caseload
 // ─────────────────────────────────────────────────────────────────────────────
 PageOutcome page_outcome(PageVerdict v) {
@@ -391,6 +539,12 @@ PageOutcome page_outcome(PageVerdict v) {
             return {Outcome::Indeterminate, Reason::UrlDead};
         case PageVerdict::HttpBlocked:
             return {Outcome::Indeterminate, Reason::Blocked};
+        case PageVerdict::HttpBlockedEgress:
+            return {Outcome::Indeterminate, Reason::EgressBlocked};
+        case PageVerdict::HttpBlockedClient:
+            return {Outcome::Indeterminate, Reason::ClientBlocked};
+        case PageVerdict::FunnelOnly:
+            return {Outcome::Indeterminate, Reason::NoListingPage};
         case PageVerdict::HttpThrottled:
             return {Outcome::Indeterminate, Reason::RateLimited};
         case PageVerdict::HttpServerError:
@@ -411,6 +565,17 @@ bool ours(PageVerdict v) {
         case PageVerdict::Ambiguous:
         case PageVerdict::Silent:
         case PageVerdict::Empty:
+        // The attributed walls join the list (s15). Both are configuration --
+        // our exit, our client shape -- and neither is the far end saying
+        // anything about the listing. Left in the streak they would read,
+        // months later, as a broker that keeps refusing us, and could argue a
+        // live case toward Abandoned on the strength of a settings choice.
+        // Plain `HttpBlocked` deliberately stays out: an unattributed wall
+        // might really be the broker, and we do not get to assume otherwise.
+        case PageVerdict::HttpBlockedEgress:
+        case PageVerdict::HttpBlockedClient:
+        // Nobody's failure at all, so nothing to count.
+        case PageVerdict::FunnelOnly:
             return true;
         default:
             return false;
@@ -426,6 +591,26 @@ Case apply_page_verdict(const Case& c, PageVerdict v, const std::string& today,
     // belongs to the far end. Not for ours.
     if (ours(v)) n.consecutive_failures = c.consecutive_failures;
     return n;
+}
+
+std::vector<const Case*> caseload_walled(const Caseload& c) {
+    std::vector<const Case*> out;
+    for (const Case& k : c) {
+        if (k.outcome != Outcome::Indeterminate) continue;
+        if (k.reason == Reason::Blocked || k.reason == Reason::EgressBlocked ||
+            k.reason == Reason::ClientBlocked)
+            out.push_back(&k);
+    }
+    return out;
+}
+
+std::vector<const Case*> caseload_unverifiable_by_design(const Caseload& c) {
+    std::vector<const Case*> out;
+    for (const Case& k : c) {
+        if (k.outcome != Outcome::Indeterminate) continue;
+        if (k.reason == Reason::NoListingPage) out.push_back(&k);
+    }
+    return out;
 }
 
 std::vector<const Case*> caseload_unverifiable(const Caseload& c) {
@@ -480,6 +665,8 @@ PageRules rules_load(const std::string& file, std::string* error) {
             p.absent      = str_list(j, "absent");
             p.needs_needle = j.contains("needs_needle") && j.at("needs_needle").is_boolean()
                                  ? j.at("needs_needle").get<bool>() : false;
+            p.funnel_only  = j.contains("funnel_only") && j.at("funnel_only").is_boolean()
+                                 ? j.at("funnel_only").get<bool>() : false;
             p.reviewed    = str_or(j, "reviewed");
             p.notes       = str_or(j, "notes");
             out.push_back(p);
@@ -508,6 +695,7 @@ bool rules_save(const std::string& file, const PageRules& r) {
         j["present"]      = p.present;
         j["absent"]       = p.absent;
         j["needs_needle"] = p.needs_needle;
+        j["funnel_only"]  = p.funnel_only;
         j["reviewed"]     = p.reviewed;
         j["notes"]        = p.notes;
         root["rules"].push_back(j);

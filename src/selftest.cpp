@@ -10,8 +10,10 @@
 #include "core/Case.hpp"
 #include "core/Egress.hpp"
 #include "core/Intake.hpp"
+#include "core/Journal.hpp"
 #include "core/PageRules.hpp"
 #include "core/Probe.hpp"
+#include "core/Profile.hpp"
 #include "core/RosterImport.hpp"
 #include "net/Fetch.hpp"
 #include "net/Observer.hpp"
@@ -1798,7 +1800,8 @@ int run() {
             PageVerdict::Ambiguous, PageVerdict::Silent, PageVerdict::Empty,
             PageVerdict::NoResponse, PageVerdict::HttpDead, PageVerdict::HttpBlocked,
             PageVerdict::HttpThrottled, PageVerdict::HttpServerError,
-            PageVerdict::HttpUnexpected};
+            PageVerdict::HttpUnexpected, PageVerdict::HttpBlockedEgress,
+            PageVerdict::HttpBlockedClient, PageVerdict::FunnelOnly};
         bool named = true, spoke = true, quiet = true;
         for (PageVerdict v : all) {
             const std::string nm = page_verdict_name(v);
@@ -1819,6 +1822,179 @@ int run() {
               !page_verdict_is_clean(PageVerdict::Silent) &&
               !page_verdict_is_clean(PageVerdict::HttpDead),
               "three verdicts answer the question; the rest are refusals");
+    }
+
+    std::printf("\nthe three walls, told apart (s15)\n");
+    {
+        // The vocabulary exists because one `Blocked` made three problems with
+        // three different owners look like one. Each of these pins a wall the
+        // first live checks actually hit.
+        const std::string vpn_wall =
+            "<html><body><h1>Access Denied</h1><p>We do not allow connections "
+            "from VPN or proxy services.</p></body></html>";
+        const std::string bot_wall =
+            "<html><body><h1>Access Denied</h1><p>Please enable JavaScript to "
+            "continue.</p></body></html>";
+        const std::string mute_wall =
+            "<html><body><h1>403 Forbidden</h1></body></html>";
+
+        check(refusal_attribute(vpn_wall) == PageVerdict::HttpBlockedEgress,
+              "a wall that names VPNs refused the address, and says so");
+        check(refusal_attribute(bot_wall) == PageVerdict::HttpBlockedClient,
+              "a wall that asks for JavaScript refused the client, not the exit");
+        check(refusal_attribute(mute_wall) == PageVerdict::HttpBlocked,
+              "a wall that says only 'forbidden' is left unattributed -- "
+              "guessing here sends the user to fix the wrong thing");
+        check(refusal_attribute("") == PageVerdict::HttpBlocked,
+              "and a wall with no words at all stays unattributed");
+
+        // The Ambiguous rule, applied to walls: two stories is no story.
+        const std::string both =
+            "<html><body><p>VPN traffic is not permitted and you must enable "
+            "JavaScript.</p></body></html>";
+        check(refusal_attribute(both) == PageVerdict::HttpBlocked,
+              "a wall telling both stories is telling neither");
+
+        // Generic refusal words are deliberately absent from both sets: they
+        // are what plain Blocked already means.
+        check(refusal_attribute("<p>Access denied. Request blocked.</p>")
+                  == PageVerdict::HttpBlocked,
+              "generic anger is not attribution");
+
+        PageRule r;
+        r.broker_id = "acme";
+        r.fingerprint = {"acme people search"};
+        r.present = {"view full report"};
+        r.absent = {"no results found"};
+
+        check(page_check(&r, 403, vpn_wall) == PageVerdict::HttpBlockedEgress &&
+              page_check(&r, 403, bot_wall) == PageVerdict::HttpBlockedClient &&
+              page_check(&r, 401, vpn_wall) == PageVerdict::HttpBlockedEgress,
+              "page_check routes 401 and 403 through the wall's own words");
+
+        // The listing markers must STILL never run over a wall's body, however
+        // the wall is attributed. This is the s8 invariant and it survives.
+        const std::string wall_saying_absent =
+            "<html><body><h1>Acme People Search</h1><p>No results found.</p>"
+            "<p>Please enable JavaScript.</p></body></html>";
+        check(page_check(&r, 403, wall_saying_absent) == PageVerdict::HttpBlockedClient,
+              "a wall echoing the broker's own absence copy is still a wall");
+
+        // Whose fault, and therefore whose streak.
+        Case k = mkcase("wall-1", "acme");
+        k.consecutive_failures = 3;
+        check(apply_page_verdict(k, PageVerdict::HttpBlockedEgress, "2026-03-01", 45)
+                  .consecutive_failures == 3 &&
+              apply_page_verdict(k, PageVerdict::HttpBlockedClient, "2026-03-01", 45)
+                  .consecutive_failures == 3,
+              "an attributed wall is our configuration, so it does not move the "
+              "streak toward calling a live listing dead");
+        check(apply_page_verdict(k, PageVerdict::HttpBlocked, "2026-03-01", 45)
+                  .consecutive_failures == 4,
+              "an UNattributed wall might really be the broker, and still counts");
+
+        check(page_outcome(PageVerdict::HttpBlockedEgress).reason == Reason::EgressBlocked &&
+              page_outcome(PageVerdict::HttpBlockedClient).reason == Reason::ClientBlocked &&
+              page_outcome(PageVerdict::HttpBlocked).reason == Reason::Blocked,
+              "each wall reaches the case under its own name");
+        check(page_outcome(PageVerdict::HttpBlockedEgress).outcome == Outcome::Indeterminate &&
+              page_outcome(PageVerdict::HttpBlockedClient).outcome == Outcome::Indeterminate &&
+              page_outcome(PageVerdict::FunnelOnly).outcome == Outcome::Indeterminate,
+              "and none of them rounds to NotFound -- a wall is not a removal");
+    }
+
+    std::printf("\na broker with no page to check\n");
+    {
+        PageRule funnel;
+        funnel.broker_id = "funnelco";
+        funnel.funnel_only = true;
+        funnel.notes = "Lead-capture funnel; results live behind a form.";
+
+        check(!rule_verifiable(&funnel),
+              "a funnel-only broker refuses the fetch before it happens");
+        check(rule_verifiable(nullptr),
+              "but a MISSING rule is still fetchable -- unreadable and "
+              "unpublishable are different refusals with different owners");
+
+        // Whatever came back, it is not evidence. Even a perfectly good page.
+        check(page_check(&funnel, 200,
+                  "<html><body><p>View full report</p></body></html>")
+                  == PageVerdict::FunnelOnly,
+              "and a 200 from a funnel is still not a listing");
+        check(page_check(&funnel, 403, "<p>Access denied</p>") == PageVerdict::FunnelOnly,
+              "nor does the status code get a say");
+
+        check(page_outcome(PageVerdict::FunnelOnly).reason == Reason::NoListingPage,
+              "it reaches the case as NoListingPage");
+
+        Case k = mkcase("funnel-1", "funnelco");
+        k.consecutive_failures = 2;
+        check(apply_page_verdict(k, PageVerdict::FunnelOnly, "2026-03-01", 45)
+                  .consecutive_failures == 2,
+              "nobody failed, so nothing is counted against anybody");
+
+        // Validation: a funnel rule carries one fact and no markers.
+        PageRules ok = {funnel};
+        check(rules_validate(ok).empty(),
+              "a funnel-only rule needs no fingerprint and no markers");
+
+        PageRule contradictory = funnel;
+        contradictory.needs_needle = true;
+        PageRules bad = {contradictory};
+        check(!rules_validate(bad).empty(),
+              "and may not also demand needles from a page that does not exist");
+
+        PageRule littered = funnel;
+        littered.present = {"view full report"};
+        PageRules junk = {littered};
+        check(!rules_validate(junk).empty(),
+              "markers that will never run are a mistake, said out loud");
+
+        // Round-trip: the flag survives the pump.
+        const std::string f = tmp_path("delr_funnel_rules.json");
+        std::filesystem::remove(f);
+        check(rules_save(f, ok), "a funnel-only rule saves");
+        PageRules back = rules_load(f);
+        check(back.size() == 1 && back[0].funnel_only,
+              "and comes back still knowing there is no page");
+        std::filesystem::remove(f);
+    }
+
+    std::printf("\nthe queues a person can actually act on\n");
+    {
+        // Three lists, three owners. Collapsing any two is how the app spent
+        // six sessions blaming the page rules for a missing profile.
+        Caseload c;
+        auto add = [&](const char* id, Reason r) {
+            Case k = mkcase(id, "acme");
+            k.outcome = Outcome::Indeterminate;
+            k.reason = r;
+            c.push_back(k);
+        };
+        add("m1", Reason::NoRule);
+        add("m2", Reason::PageUnreadable);
+        add("w1", Reason::EgressBlocked);
+        add("w2", Reason::ClientBlocked);
+        add("w3", Reason::Blocked);
+        add("d1", Reason::NoListingPage);
+        Case live = mkcase("live", "acme");
+        live.outcome = Outcome::Listed;
+        c.push_back(live);
+
+        check(caseload_unverifiable(c).size() == 2,
+              "the maintenance queue holds only what a maintainer can fix");
+        check(caseload_walled(c).size() == 3,
+              "the walled list holds every refusal from the far end");
+        check(caseload_unverifiable_by_design(c).size() == 1,
+              "and a broker with no page to check sits in neither");
+
+        // The one that matters: a wall must never look like a rotted rule.
+        for (const Case* k : caseload_unverifiable(c))
+            check(k->reason != Reason::EgressBlocked &&
+                  k->reason != Reason::ClientBlocked &&
+                  k->reason != Reason::NoListingPage,
+                  std::string("no wall is filed as a maintenance job (") +
+                      k->id + ")");
     }
 
     std::printf("\nwhat a page verdict means to a case\n");
@@ -2548,6 +2724,500 @@ int run() {
         badhost[0].hosts.push_back("https://alpha.example/x");
         check(!roster_validate(badhost).empty(),
               "a URL where a bare hostname belongs is caught, not left to never match");
+    }
+
+    // ── core/Profile -- table four ───────────────────────────────────────────
+    {
+        std::printf("\ncore/Profile -- parsing what the user typed\n");
+
+        // One term per line, and everything the surface would otherwise have
+        // had an opinion about happens HERE.
+        const std::vector<std::string> t = terms_parse(
+            "  John Smith \n\njohn  smith\nJOHN SMITH\nJane Smith\n   \n");
+        check(t.size() == 2, "blank lines and duplicates collapse; two terms survive");
+        check(t.front() == "John Smith",
+              "the first spelling is the one kept -- order is the user's");
+        check(terms_parse("a\tb\n  c   d  ") ==
+                  (std::vector<std::string>{"a b", "c d"}),
+              "inner whitespace collapses, so a term pasted from a web page "
+              "compares equal to the same term typed");
+        check(terms_join(t) == "John Smith\nJane Smith",
+              "and the join is the inverse, so the box repaints what it parsed");
+        check(terms_parse(terms_join(t)) == t, "round trip");
+
+        std::printf("\nphones become the forms a page PRINTS\n");
+        check(phone_digits("(615) 555-0100") == "6155550100", "punctuation is not a phone number");
+        check(phone_digits("+1 615 555 0100") == "6155550100", "nor is a country code");
+        check(phone_digits("555-0100") == "5550100", "seven digits is still a phone");
+        check(phone_digits("12") .empty(), "two is not");
+        const std::vector<std::string> v = phone_variants("6155550100");
+        auto has = [&](const std::string& s) {
+            return std::find(v.begin(), v.end(), s) != v.end();
+        };
+        check(has("6155550100") && has("615-555-0100") && has("(615) 555-0100"),
+              "one number yields the bare, dashed and parenthesised forms");
+        check(v.size() >= 6, "and the rest of the closed set with them");
+        check(phone_variants("").empty(), "nothing in, nothing out");
+
+        std::printf("\nwhat may be used to confirm a page is yours\n");
+        check(needle_usable("Ng"), "a two-letter surname is a real name and a real needle");
+        check(!needle_usable("J"), "a middle initial matches the whole internet");
+        check(!needle_usable("1984"), "and so does a four-digit year -- every copyright line");
+        check(needle_usable("37211"), "a zip is the shortest number that is about a person");
+        check(!needle_usable("  "), "whitespace is not a term");
+
+        Profile p;
+        p.full_name = "John Smith";
+        p.also_known_as = {"Jack Smith"};
+        p.emails = {"john@example.com", "jsmith@work.example.com"};
+        p.contact_email = "john@example.com";
+        p.phones = {"(615) 555-0100"};
+        p.usernames = {"jsmith77"};
+        p.places = {"Nashville, TN"};
+        p.birth_year = 1984;
+
+        const PageNeedles n = needles_for(p);
+        auto needled = [&](const std::string& s) {
+            return std::find(n.terms.begin(), n.terms.end(), s) != n.terms.end();
+        };
+        check(needled("John Smith") && needled("Jack Smith") && needled("jsmith77")
+                  && needled("Nashville, TN"),
+              "names, aliases, usernames and places all become needles");
+        check(needled("615-555-0100"),
+              "and a phone arrives as the string a page would print");
+        check(!needled("john@example.com"),
+              "an email does NOT -- brokers mask them, so the needle could not "
+              "match a page that really is yours");
+        check(!needled("1984"),
+              "and neither does a birth year: it disambiguates for a reader, "
+              "not for a substring matcher");
+        check(!n.require_all,
+              "ANY, because a listing that omits your city is still your listing");
+
+        std::printf("\nthe needles reach page_check, which is the point of all this\n");
+        PageRule r;
+        r.broker_id = "beta";
+        r.fingerprint = {"Beta Lookup"};
+        r.present     = {"View full report"};
+        r.absent      = {"No results found"};
+        r.needs_needle    = true;
+        const std::string mine =
+            "<html><body>Beta Lookup -- View full report for John Smith of "
+            "Nashville, TN</body></html>";
+        const std::string other =
+            "<html><body>Beta Lookup -- View full report for Alice Jones of "
+            "Portland, OR</body></html>";
+        check(page_check(&r, 200, mine, n) == PageVerdict::Present,
+              "a page carrying the profile's name confirms the listing");
+        check(page_check(&r, 200, other, n) == PageVerdict::NeedleAbsent,
+              "and one carrying somebody else's does not");
+        check(page_check(&r, 200, mine, needles_for(Profile{}))
+                  == PageVerdict::NoNeedles,
+              "an EMPTY profile still yields NoNeedles -- which is what every "
+              "check has done since s8, and is why this table exists");
+        const std::string phoned =
+            "<html><body>Beta Lookup -- View full report -- (615) 555-0100"
+            "</body></html>";
+        check(page_check(&r, 200, phoned, n) == PageVerdict::Present,
+              "a page that prints only the phone number, formatted, still matches");
+
+        std::printf("\nvalidation, and the invariant that keeps filing honest\n");
+        check(profile_validate(p).empty(), "a well-formed profile has nothing to say");
+        Profile bad = p;
+        bad.contact_email = "elsewhere@example.com";
+        check(!profile_validate(bad).empty(),
+              "an opt-out cannot be filed from an address the profile never listed");
+        bad = p; bad.emails.push_back("not an address");
+        check(!profile_validate(bad).empty(), "an email without an @ is caught");
+        bad = p; bad.birth_year = 84;
+        check(!profile_validate(bad).empty(), "and a two-digit year");
+        bad = p; bad.phones.push_back("abc");
+        check(!profile_validate(bad).empty(), "and a phone with no digits in it");
+        bad = p; bad.places.push_back("nashville, tn");
+        check(!profile_validate(bad).empty(),
+              "a hand-edited file listing one place twice is reported");
+
+        std::printf("\nnothing about a profile reaches a log\n");
+        const std::string ref = profile_log_ref(p);
+        bool leaked = false;
+        for (const char* pii : {"John", "Smith", "jsmith77", "Nashville",
+                                "example.com", "555", "1984"})
+            if (ref.find(pii) != std::string::npos) leaked = true;
+        check(!leaked, "log_ref carries counts and not one character of the person");
+        check(ref.find("needles") != std::string::npos,
+              "while still saying enough to debug with");
+        const std::string sum = profile_summary(p);
+        check(sum.find("Smith") == std::string::npos,
+              "and the window's summary line is counts too");
+        check(profile_summary(Profile{}).find("No profile") != std::string::npos,
+              "an empty profile says so plainly rather than showing a zero");
+
+        std::printf("\nthe pump\n");
+        check(profile_is_empty(Profile{}), "a default profile is empty");
+        check(!profile_is_empty(p), "and a filled one is not");
+        const std::string f = tmp_path("delr_profile_test.json");
+        std::filesystem::remove(f);
+        std::string err = "x";
+        const Profile missing = profile_load(f, &err);
+        check(profile_is_empty(missing) && err.empty(),
+              "a missing file is a first run, not an error");
+        check(profile_save(f, p), "save writes");
+        const Profile back = profile_load(f, &err);
+        check(err.empty() && back.full_name == p.full_name
+                  && back.emails == p.emails && back.phones == p.phones
+                  && back.places == p.places && back.usernames == p.usernames
+                  && back.also_known_as == p.also_known_as
+                  && back.birth_year == p.birth_year
+                  && back.contact_email == p.contact_email,
+              "and every field comes back the way it went in");
+        check(needles_for(back).terms == n.terms,
+              "so the needles a reload derives are the needles the write had");
+        {
+            // The one property that matters more than the content: this file
+            // holds the person, and it may not be readable by anyone else.
+            const auto mode = std::filesystem::status(f).permissions();
+            check((mode & (std::filesystem::perms::group_all
+                           | std::filesystem::perms::others_all))
+                      == std::filesystem::perms::none,
+                  "and the file is 0600 -- no group, no other");
+        }
+        {
+            std::ofstream junk(f, std::ios::trunc);
+            junk << "{ not json";
+        }
+        err.clear();
+        check(profile_is_empty(profile_load(f, &err)) && !err.empty(),
+              "malformed JSON yields an empty profile AND says why");
+        std::filesystem::remove(f);
+
+        std::printf("\npaths\n");
+        check(delr::paths::profile_file().find("profile.json") != std::string::npos,
+              "the profile lives beside the caseload, under state");
+        check(delr::paths::profile_file() != delr::paths::cases_file(),
+              "and not on top of it");
+    }
+
+    // ── core/Journal -- table five: what this program DID, and when ──────────
+    {
+        std::printf("\n\ncore/Journal -- the run history the case could not hold\n");
+
+        check(std::string(kind_name(Kind::Checked)) == "checked"
+                  && kind_from("checked") == Kind::Checked
+                  && kind_from("opened") == Kind::Opened
+                  && kind_from("declined") == Kind::Declined
+                  && kind_from("changed") == Kind::Changed,
+              "every kind round-trips through its name");
+        check(kind_from("filed") == Kind::Other,
+              "and a kind from a newer delr lands as Other rather than nowhere");
+
+        std::printf("\nthe builders read the case, not a second opinion\n");
+        {
+            Case k = mkcase("c1", "spokeo");
+            const Entry o = entry_opened(k, "2026-02-01");
+            check(o.kind == Kind::Opened && o.case_id == "c1"
+                      && o.broker_id == "spokeo" && o.date == "2026-02-01",
+                  "opening a case records the case and the day");
+            check(o.outcome == Outcome::Never && o.reason == Reason::None,
+                  "and claims nothing about a check that has not happened");
+
+            k = apply_check(k, Outcome::Indeterminate, Reason::EgressBlocked,
+                            "2026-03-01", 3);
+            const Entry c = entry_checked(k, "2026-03-01");
+            check(c.kind == Kind::Checked && c.outcome == Outcome::Indeterminate
+                      && c.reason == Reason::EgressBlocked,
+                  "a checked entry carries the outcome the case just took");
+
+            const Entry d = entry_declined(k, Reason::NoTunnel, "2026-03-02");
+            check(d.kind == Kind::Declined && d.reason == Reason::NoTunnel,
+                  "a decline carries why nothing left this machine");
+            check(d.outcome == Outcome::Never,
+                  "and NO outcome -- a decline is not a failed look, it is no look");
+
+            Case r = k;
+            r.provenance = Provenance::SelfVerified;
+            const Entry ch = entry_changed(r, Status::Found, Status::Removed,
+                                           "2026-04-01");
+            check(ch.kind == Kind::Changed && ch.from == Status::Found
+                      && ch.to == Status::Removed
+                      && ch.provenance == Provenance::SelfVerified,
+                  "a change carries the transition AND who says so");
+            const Entry rel = entry_changed(r, Status::Removed, Status::Relisted,
+                                            "2026-05-01", "c1-2");
+            check(rel.other_id == "c1-2",
+                  "and a relist points at its successor -- one event, two rows");
+        }
+
+        std::printf("\nnothing about an entry reaches a log\n");
+        {
+            Entry e = entry_checked(mkcase("c1", "spokeo"), "2026-03-01");
+            e.seq = 7;
+            const std::string ref = log_ref(e);
+            check(ref == "entry:7/checked@c1", "the ref is seq, kind and case id");
+            check(ref.find("spokeo") == std::string::npos
+                      && ref.find("2026") == std::string::npos
+                      && ref.find("https") == std::string::npos,
+                  "and carries no broker, no date and no url");
+        }
+
+        std::printf("\nthe queries a snapshot cannot answer\n");
+        {
+            Journal j;
+            std::int64_t n = 1;
+            const auto push = [&](Entry e) { e.seq = n++; j.push_back(e); };
+
+            Case a = mkcase("a", "spokeo");
+            push(entry_opened(a, "2026-01-01"));
+            a = apply_check(a, Outcome::Listed, Reason::None, "2026-01-10", 45);
+            push(entry_checked(a, "2026-01-10"));
+            a = apply_check(a, Outcome::Indeterminate, Reason::EgressBlocked,
+                            "2026-02-01", 3);
+            push(entry_checked(a, "2026-02-01"));
+            push(entry_declined(a, Reason::NoTunnel, "2026-02-05"));
+            a = apply_check(a, Outcome::Indeterminate, Reason::EgressBlocked,
+                            "2026-02-20", 3);
+            push(entry_checked(a, "2026-02-20"));
+
+            Case b = mkcase("b", "acxiom");
+            push(entry_opened(b, "2026-01-03"));
+
+            check(journal_for_case(j, "a").size() == 5,
+                  "a case's own history comes back, and only its own");
+            check(journal_for_case(j, "nobody").empty(),
+                  "and an unknown case has no history rather than everyone's");
+            check(journal_for_case(j, "").empty(),
+                  "an empty id matches nothing -- it is not a wildcard");
+
+            check(journal_last(j, "a", Kind::Checked)->date == "2026-02-20",
+                  "the last check is the last one, not the first");
+            check(journal_first(j, "a", Kind::Checked)->date == "2026-01-10",
+                  "and the first is the first -- the one a deadline runs from");
+            check(journal_last(j, "b", Kind::Checked) == nullptr,
+                  "a case that has never been checked says so with a null");
+            check(journal_last(j, "a", Kind::Other) == nullptr,
+                  "the last entry of a kind we do not understand is not a question");
+
+            check(journal_since(j, "2026-02-01").size() == 3,
+                  "since a date means on or after it");
+            check(journal_since(j, "not-a-date").empty(),
+                  "and a malformed filter yields NOTHING, never everything");
+
+            std::printf("\nhow long has this broker been refusing us\n");
+            check(journal_walled_since(j, "a") == "2026-02-01",
+                  "the current run of walls starts where it started");
+            check(journal_walled_since(j, "b").empty(),
+                  "a case that was never walled has no such date");
+
+            // The decline sat in the middle of the run. Our own tunnel being
+            // down is not evidence about the broker, so it neither broke the
+            // run nor started it -- the same reason apply_egress_refusal
+            // leaves the failure streak alone.
+            check(journal_walled_since(j, "a") != "2026-02-05",
+                  "and our own outage does not restart the broker's clock");
+
+            {
+                Journal k = j;
+                Case c = mkcase("a", "spokeo");
+                c = apply_check(c, Outcome::NotFound, Reason::None, "2026-03-01", 45);
+                Entry clean = entry_checked(c, "2026-03-01");
+                clean.seq = 99;
+                k.push_back(clean);
+                check(journal_walled_since(k, "a").empty(),
+                      "a clean look ends the run -- the wall is over, not older");
+
+                Case d = mkcase("a", "spokeo");
+                d = apply_check(d, Outcome::Indeterminate, Reason::Blocked,
+                                "2026-03-10", 3);
+                Entry again = entry_checked(d, "2026-03-10");
+                again.seq = 100;
+                k.push_back(again);
+                check(journal_walled_since(k, "a") == "2026-03-10",
+                      "and a new wall after it is a NEW run, not the old one resumed");
+            }
+
+            check(reason_is_wall(Reason::Blocked) && reason_is_wall(Reason::EgressBlocked)
+                      && reason_is_wall(Reason::ClientBlocked)
+                      && reason_is_wall(Reason::NoListingPage),
+                  "all four walls count as walls, unattributed included");
+            check(!reason_is_wall(Reason::NoRule) && !reason_is_wall(Reason::NoTunnel)
+                      && !reason_is_wall(Reason::PageUnreadable),
+                  "and none of our own bugs is allowed to look like one");
+
+            std::printf("\nthe honest denominator\n");
+            const Tally t = journal_tally(j, "a");
+            check(t.checked == 3, "three fetches ran");
+            check(t.declined == 1, "one act sent nothing");
+            check(t.clean == 1, "and only one of them actually saw the page");
+            check(t.walled == 2, "two were the far end refusing");
+            check(journal_tally(j).checked == 3,
+                  "an empty id tallies the whole journal rather than nothing");
+        }
+
+        std::printf("\nvalidation, after the fact and never instead of it\n");
+        {
+            Journal j;
+            Case k = mkcase("a", "spokeo");
+            Entry e1 = entry_opened(k, "2026-01-01"); e1.seq = 1;
+            k = apply_check(k, Outcome::Listed, Reason::None, "2026-01-10", 45);
+            Entry e2 = entry_checked(k, "2026-01-10"); e2.seq = 2;
+            j = {e1, e2};
+            check(journal_validate(j).empty(), "a well-formed journal has nothing to say");
+
+            Journal back = j; back[1].seq = 1;
+            check(!journal_validate(back).empty(), "a seq that does not increase is caught");
+
+            Journal dated = j; dated[1].date = "2025-12-01";
+            check(!journal_validate(dated).empty(), "and a date that goes backwards");
+
+            Journal noreason = j;
+            noreason[1].outcome = Outcome::Indeterminate;
+            noreason[1].reason  = Reason::None;
+            check(!journal_validate(noreason).empty(),
+                  "an indeterminate without a reason -- the same invariant Case guards");
+
+            Journal spurious = j; spurious[1].reason = Reason::Blocked;
+            check(!journal_validate(spurious).empty(),
+                  "and a reason on an outcome that was not indeterminate");
+
+            Journal nodecl = j;
+            nodecl[1].kind = Kind::Declined;
+            nodecl[1].outcome = Outcome::Never;
+            nodecl[1].reason = Reason::None;
+            check(!journal_validate(nodecl).empty(), "a decline with no reason is caught");
+
+            Journal nomove = j;
+            nomove[1].kind = Kind::Changed;
+            nomove[1].outcome = Outcome::Never;
+            nomove[1].from = Status::Found;
+            nomove[1].to   = Status::Found;
+            check(!journal_validate(nomove).empty(),
+                  "and a change to what it already was is not a change");
+
+            Journal orphan = j; orphan[1].case_id.clear();
+            check(!journal_validate(orphan).empty(), "an entry about no case is caught");
+        }
+
+        std::printf("\nthe pump -- append-only, and line-tolerant on purpose\n");
+        {
+            const std::string f = tmp_path("delr_journal_test.ndjson");
+            std::filesystem::remove(f);
+
+            std::string err;
+            int skipped = 0;
+            check(journal_load(f, &err, &skipped).empty() && err.empty(),
+                  "a missing file is a first run, not an error");
+
+            Case k = mkcase("a", "spokeo");
+            Entry e1 = entry_opened(k, "2026-01-01");
+            check(journal_record(f, e1) && e1.seq == 1,
+                  "the first entry lands and takes seq 1");
+
+            k = apply_check(k, Outcome::Indeterminate, Reason::ClientBlocked,
+                            "2026-01-10", 3);
+            Entry e2 = entry_checked(k, "2026-01-10");
+            check(journal_record(f, e2) && e2.seq == 2,
+                  "and the next one takes the next seq without being told");
+
+            Journal j = journal_load(f, &err, &skipped);
+            check(err.empty() && skipped == 0 && j.size() == 2,
+                  "both come back, in order, with nothing skipped");
+            check(j[0].kind == Kind::Opened && j[1].kind == Kind::Checked
+                      && j[1].reason == Reason::ClientBlocked
+                      && j[1].broker_id == "spokeo" && j[1].date == "2026-01-10",
+                  "and every field survives the round trip");
+            check(journal_validate(j).empty(), "what the pump wrote validates");
+
+            {
+                // The property the whole file format was chosen for.
+                std::ifstream in(f);
+                std::string l1, l2;
+                std::getline(in, l1); std::getline(in, l2);
+                check(!l1.empty() && !l2.empty()
+                          && l1.find('\n') == std::string::npos,
+                      "one entry per line -- an appended row, not a rewritten file");
+            }
+            {
+                const auto mode = std::filesystem::status(f).permissions();
+                check((mode & (std::filesystem::perms::group_all
+                               | std::filesystem::perms::others_all))
+                          == std::filesystem::perms::none,
+                      "and the file is 0600 -- no group, no other");
+            }
+
+            std::printf("\na torn tail costs one line, never the file\n");
+            {
+                std::ofstream tear(f, std::ios::app);
+                tear << "{\"seq\": 3, \"kind\": \"chec";   // killed mid-write
+            }
+            skipped = 0; err.clear();
+            Journal torn = journal_load(f, &err, &skipped);
+            check(torn.size() == 2 && skipped == 1 && err.empty(),
+                  "the half-written line is skipped and the good ones survive");
+
+            Case k3 = mkcase("a", "spokeo");
+            Entry e3 = entry_declined(k3, Reason::NoTunnel, "2026-01-20");
+            check(journal_record(f, e3) && e3.seq == 3,
+                  "the next append still lands on top of the damage");
+            skipped = 0;
+            Journal healed = journal_load(f, &err, &skipped);
+            check(healed.size() == 3 && skipped == 1,
+                  "and it healed the tear into ONE bad line rather than fusing to it");
+            check(healed[2].kind == Kind::Declined && healed[2].reason == Reason::NoTunnel,
+                  "the entry written after the damage is intact");
+
+            std::printf("\nan entry from a newer delr survives an older binary\n");
+            {
+                const std::string g = tmp_path("delr_journal_fwd.ndjson");
+                std::filesystem::remove(g);
+                {
+                    std::ofstream fut(g);
+                    fut << R"({"seq":1,"date":"2026-06-01","case_id":"a",)"
+                           R"("broker_id":"spokeo","kind":"filed","outcome":"never",)"
+                           R"("reason":"none","from":"unknown","to":"unknown",)"
+                           R"("provenance":"none","other_id":""})" << "\n";
+                }
+                Journal fwd = journal_load(g);
+                check(fwd.size() == 1 && fwd[0].kind == Kind::Other,
+                      "a kind we have never heard of decodes as Other");
+                check(fwd[0].kind_raw == "filed",
+                      "with its label kept -- the row is not flattened");
+                check(fwd[0].case_id == "a" && fwd[0].date == "2026-06-01",
+                      "and everything we DO understand about it is still there");
+
+                const std::string h = tmp_path("delr_journal_fwd2.ndjson");
+                std::filesystem::remove(h);
+                Entry pass = fwd[0];
+                check(journal_append(h, pass, 1), "it can be written back out");
+                Journal again = journal_load(h);
+                check(again.size() == 1 && again[0].kind_raw == "filed",
+                      "and comes back as 'filed', not as 'other' -- proof is not destroyed");
+                std::filesystem::remove(g);
+                std::filesystem::remove(h);
+            }
+
+            std::printf("\nthe append never refuses on content\n");
+            {
+                // Deliberately invalid: no case, no reason, backwards date. It
+                // still lands. The moment an event happens is the worst
+                // possible moment to decide it was not worth recording.
+                Entry bad;
+                bad.kind = Kind::Checked;
+                bad.date = "1999-01-01";
+                bad.outcome = Outcome::Indeterminate;
+                check(journal_record(f, bad), "a malformed entry is still recorded");
+                Journal with_bad = journal_load(f);
+                check(!journal_validate(with_bad).empty(),
+                      "and validation is what notices, AFTER it is safely on disk");
+            }
+
+            std::filesystem::remove(f);
+        }
+
+        std::printf("\npaths\n");
+        check(delr::paths::journal_file().find("journal.ndjson") != std::string::npos,
+              "the journal lives under state with the caseload");
+        check(delr::paths::journal_file() != delr::paths::cases_file()
+                  && delr::paths::journal_file() != delr::paths::profile_file(),
+              "and on top of nothing");
     }
 
     std::printf("\n%d pass / %d fail\n", g_pass, g_fail);

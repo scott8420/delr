@@ -272,9 +272,23 @@ void Shell::on_reload_cases() {
     //
     // Named by BROKER, not by case: the fix is a rule, and a rule is per
     // broker. A list of case ids would tell the user nothing they can act on.
+    // The profile comes FIRST when there isn't one, and that ordering is the
+    // point. Without a profile every needle-requiring rule returns NoNeedles,
+    // which lands in `caseload_unverifiable` looking exactly like a rotted
+    // page rule -- and it is not one. It is the user's own missing half, it is
+    // the only entry on this line they can fix themselves, and for six
+    // sessions the window blamed the rules for it.
+    std::string maintenance;
+    if (core::profile_is_empty(m_profile)) {
+        maintenance =
+            "No profile yet, so delr cannot tell whether a record on a page is "
+            "yours -- every check on a per-person listing will come back "
+            "unverified rather than clean. Fill in the You page.";
+    }
+
     const auto stuck = core::caseload_unverifiable(m_caseload);
     if (stuck.empty()) {
-        m_cases_maintenance.set_text("");
+        m_cases_maintenance.set_text(maintenance);
     } else {
         std::vector<std::string> who;
         for (const core::Case* k : stuck) {
@@ -289,6 +303,7 @@ void Shell::on_reload_cases() {
         line +=
             ". That is a page rule missing or out of date, not an answer about "
             "the listing: those checks count as unverified and never as gone.";
+        if (!maintenance.empty()) line = maintenance + "\n" + line;
         m_cases_maintenance.set_text(line);
     }
 }
@@ -357,7 +372,116 @@ void Shell::on_case_committed(core::Case fresh) {
 // that made it necessary: `paths::egress_file` is absolute or it is empty, and
 // empty means there is no home to write to, which is a refusal rather than
 // something to paper over with the working directory.
-std::string Shell::egress_file() const { return paths::egress_file(); }
+std::string Shell::egress_file() const  { return paths::egress_file(); }
+std::string Shell::profile_file() const { return paths::profile_file(); }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The profile
+//
+// Load paints the form; save reads it, validates, writes, and then RELOADS --
+// the same round-trip discipline the caseload and the egress policy use, so
+// what is on screen is what is on disk rather than what the handler believed it
+// wrote.
+//
+// Nothing here parses. `core::terms_parse` decides what a term is, and this
+// file hands it text. The one thing that looks like parsing is the birth year,
+// and even that only asks whether the box is a number -- the range check is the
+// validator's, in core, where it can be exercised.
+// ─────────────────────────────────────────────────────────────────────────────
+void Shell::on_reload_profile() {
+    std::string err;
+    m_profile = core::profile_load(profile_file(), &err);
+
+    auto lg = log::get(log::Area::App);
+    if (lg) {
+        if (!err.empty()) lg->error("profile parse failed: {}", err);
+        // COUNTS, never values. `profile_log_ref` exists so the safe thing is
+        // the easy thing -- see its header.
+        else              lg->info("{}", core::profile_log_ref(m_profile));
+    }
+
+    m_profile_name.set_text(m_profile.full_name);
+    m_profile_contact.set_text(m_profile.contact_email);
+    m_profile_year.set_text(m_profile.birth_year > 0
+                                ? std::to_string(m_profile.birth_year)
+                                : std::string());
+    m_profile_aka.set_text(core::terms_join(m_profile.also_known_as));
+    m_profile_emails.set_text(core::terms_join(m_profile.emails));
+    m_profile_phones.set_text(core::terms_join(m_profile.phones));
+    m_profile_usernames.set_text(core::terms_join(m_profile.usernames));
+    m_profile_places.set_text(core::terms_join(m_profile.places));
+
+    if (!err.empty()) {
+        m_profile_status.set_text("The profile file could not be read: " + err);
+    } else {
+        const auto problems = core::profile_validate(m_profile);
+        std::string line = core::profile_summary(m_profile);
+        for (const std::string& p : problems) line += "\n" + p;
+        m_profile_status.set_text(line);
+    }
+
+    // The cases page's account of what a check can currently prove depends on
+    // this, so it repaints -- but only once there is a caseload to repaint.
+    if (!m_caseload.empty()) on_reload_cases();
+}
+
+void Shell::on_save_profile() {
+    core::Profile p;
+    p.full_name     = m_profile_name.get_text();
+    p.contact_email = m_profile_contact.get_text();
+    p.also_known_as = core::terms_parse(m_profile_aka.text());
+    p.emails        = core::terms_parse(m_profile_emails.text());
+    p.phones        = core::terms_parse(m_profile_phones.text());
+    p.usernames     = core::terms_parse(m_profile_usernames.text());
+    p.places        = core::terms_parse(m_profile_places.text());
+    p.note          = m_profile.note;   // not on the form yet; not destroyed by it
+
+    // A blank box is 0 -- "not given" -- and anything else is whatever the user
+    // typed, handed to the validator UNCHANGED. Coercing "84" to 1984 here
+    // would be the surface making a judgement, and it would be wrong for
+    // somebody born in 1884.
+    {
+        const std::string y = m_profile_year.get_text();
+        p.birth_year = 0;
+        if (!y.empty()) {
+            try { p.birth_year = std::stoi(y); }
+            catch (const std::exception&) { p.birth_year = -1; }  // caught below
+        }
+    }
+
+    const auto problems = core::profile_validate(p);
+    auto lg = log::get(log::Area::App);
+    if (!problems.empty()) {
+        // REFUSED, not saved-with-warnings. Two of these guard invariants the
+        // rest of the app will lean on -- an opt-out filed from an address the
+        // profile never listed is a request that bounces into a mailbox nobody
+        // reads -- and a validator whose complaints can be ignored is a
+        // validator that will be.
+        std::string line = "Not saved:";
+        for (const std::string& e : problems) line += "\n" + e;
+        m_profile_status.set_text(line);
+        if (lg) lg->warn("profile not saved: {} problem(s)", problems.size());
+        return;
+    }
+
+    std::string perr;
+    if (!paths::ensure_state_dir(&perr)) {
+        m_profile_status.set_text("Not saved. " + perr);
+        if (lg) lg->error("profile save: {}", perr);
+        return;
+    }
+    if (!core::profile_save(profile_file(), p)) {
+        m_profile_status.set_text(
+            "The profile could not be written — see the log.");
+        if (lg) lg->error("profile save failed");
+        return;
+    }
+    if (lg) lg->info("profile saved: {}", core::profile_log_ref(p));
+
+    // Repaint FROM DISK. The reload proves the write round-tripped, so the
+    // trace and the window agree by construction rather than by assumption.
+    on_reload_profile();
+}
 
 void Shell::on_reload_egress() {
     std::string err;

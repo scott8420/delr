@@ -34,6 +34,15 @@ observation of them.
 whether it's still live is cheap, robust, and needs doing every 45 days
 forever. That's the job a computer should have.
 
+**Your profile is a search key, not a submission.** delr needs to know what a
+listing about you would print -- names you've gone by, places you've lived,
+numbers, handles -- because a broker's page is only evidence about *you* if your
+own details are on it. Those terms are kept on your machine, mode 0600, and
+typing them sends nothing anywhere. Old details matter most: a broker's record is
+a decade of accretion, and the address from three moves ago is often the one that
+finds you. delr asks for a birth *year* and not a date of birth, because a year
+disambiguates you from the other person with your name and that is the whole job.
+
 ## Build
 
 ```
@@ -78,6 +87,7 @@ Stub. What exists and is exercised:
 | Egress policy: bind, preflight identity, DNS mode, one named verdict | `include/core/Egress.hpp`, `src/core/Egress.cpp` | exercised |
 | A DNS mode an ordinary VPN account can meet, with the leak test as its guarantee | `include/core/Egress.hpp`, `src/core/Probe.cpp` | exercised |
 | Page rules: what a fetched page has to say for a listing to count as gone | `include/core/PageRules.hpp`, `src/core/PageRules.cpp` | exercised |
+| Profile: the terms a listing about you would print, and the needles derived from them | `include/core/Profile.hpp`, `src/core/Profile.cpp` | exercised |
 | The observer's judgment: readings -> observation | `include/core/Probe.hpp`, `src/core/Probe.cpp` | exercised |
 | The verification fetch, over libcurl, gated by the policy | `include/net/Fetch.hpp`, `src/net/Fetch.cpp` | exercised; fetches real pages |
 | The syscall shim: getifaddrs, bind, routes, echo, canary | `include/net/Observer.hpp`, `src/net/Observer.cpp` | exercised; runs a real preflight |
@@ -100,8 +110,7 @@ other, and only the case where both agree counts as working.
 
 ## Next
 
-Profile storage, encrypted at rest -- the source of the identifiers a listing is
-checked against · opt-out filing by email, which the registry makes the primary
+Opt-out filing by email, which the registry makes the primary
 channel · a journal that says loudly when nothing has run · scheduled runs over
 the whole due queue, rate limited between brokers.
 

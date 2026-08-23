@@ -28,7 +28,27 @@ Shell::Shell()
       m_check_button("shell.cases.check.button"),
       m_check_state("shell.cases.check.state"),
       m_cases_scroll("shell.cases.scroll"),
-      m_cases_list("shell.cases.list") {
+      m_cases_list("shell.cases.list"),
+      m_profile_page("shell.profile", Gtk::Orientation::VERTICAL),
+      m_profile_lede("shell.profile.lede"),
+      m_profile_tunnel("shell.profile.tunnel"),
+      m_profile_rule("shell.profile.rule"),
+      m_profile_scroll("shell.profile.scroll"),
+      m_profile_form("shell.profile.form", Gtk::Orientation::VERTICAL, 4),
+      m_profile_name_caption("shell.profile.name.caption"),
+      m_profile_name("shell.profile.name"),
+      m_profile_aka("shell.profile.aka"),
+      m_profile_emails("shell.profile.emails"),
+      m_profile_contact_caption("shell.profile.contact.caption"),
+      m_profile_contact("shell.profile.contact"),
+      m_profile_phones("shell.profile.phones"),
+      m_profile_usernames("shell.profile.usernames"),
+      m_profile_places("shell.profile.places"),
+      m_profile_year_caption("shell.profile.year.caption"),
+      m_profile_year("shell.profile.year"),
+      m_profile_actions("shell.profile.actions", Gtk::Orientation::HORIZONTAL, 8),
+      m_profile_save("shell.profile.save"),
+      m_profile_status("shell.profile.status") {
     set_name("shell");
 }
 
@@ -51,10 +71,15 @@ void Shell::build_ui() {
     if (auto lg = log::get(log::Area::Shell)) lg->info("building ui");
     build_shell();
     build_pages();
+    build_profile_page();
     bind_actions();
     on_reload_roster();   // first paint from disk
     on_reload_rules();    // before the cases: the maintenance line reads it
     on_reload_cases();
+    // Before the egress reload, because the cases page's account of what a
+    // check can currently prove depends on whether there is a profile to
+    // prove it with.
+    on_reload_profile();
     on_reload_egress();   // last: it decides whether the check button is live
 }
 

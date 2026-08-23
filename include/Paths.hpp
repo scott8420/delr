@@ -72,6 +72,27 @@ std::string state_dir();
 std::string cases_file();
 std::string egress_file();
 
+// `DELR_PROFILE` wins outright, else the file inside `state_dir`.
+//
+// The most sensitive file this program writes, and the reason it is listed
+// third rather than first is that the other two already hold most of it: a
+// listing URL carries a name and a state in its path. All three are state, all
+// three are 0600, and none of them is ever in the source tree.
+std::string profile_file();
+
+// `DELR_JOURNAL` wins outright, else the file inside `state_dir`.
+//
+// State, and the fourth of them. Less sensitive than the other three by
+// construction -- `core/Journal` carries no url, no note and no free text at
+// all, precisely because this is the file most likely to be sent to somebody
+// -- but it is still a record of one person's activity and it still never goes
+// near the source tree.
+//
+// It is also the only state file that GROWS. The other three are rewritten
+// whole; this one is appended to and never rewritten, which is why it is the
+// one whose loss would be unrecoverable.
+std::string journal_file();
+
 // Creates `state_dir` if absent and forces mode 0700 whether it created it or
 // not. Enforced on every run rather than only at creation, because a directory
 // that got made with the wrong mode once stays wrong forever otherwise, and

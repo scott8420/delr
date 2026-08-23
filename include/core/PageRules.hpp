@@ -90,6 +90,24 @@ struct PageRule {
     // and it is what makes `NeedleAbsent` available on that broker.
     bool needs_needle = false;
 
+    // ── This broker has no page to check (s15) ───────────────────────────────
+    // Some brokers publish no stable per-person listing page at all -- only a
+    // lead-capture funnel whose URL carries a session id, where "your results"
+    // are assembled behind a form and never live at an address a second visit
+    // can reach. Instant Checkmate is the one that taught us this.
+    //
+    // That is not a rule that needs writing. It is a broker that cannot be
+    // verified by fetching, ever, and the honest thing is to say so once
+    // rather than leave a case in the maintenance queue implying a maintainer
+    // could fix it. A rule with this set needs no fingerprint and no markers;
+    // it exists to carry this one fact and the `notes` explaining it.
+    //
+    // It is also a REFUSAL TO FETCH, which is the part that matters for the
+    // user: checking a funnel hands the broker a fresh visit and returns
+    // nothing. See `rule_verifiable()` -- the caller is expected to consult it
+    // BEFORE the fetch, not after.
+    bool funnel_only = false;
+
     // ISO date a human last opened this broker's page and confirmed the rule
     // still describes it. Not enforced -- see `rule_stale()`. Provenance for
     // the rule itself, in a project whose whole argument is that provenance is
@@ -102,6 +120,15 @@ struct PageRule {
 using PageRules = std::vector<PageRule>;
 
 const PageRule* rules_find(const PageRules& r, const std::string& broker_id);
+
+// May a fetch of this broker's listing page tell us anything? False only for
+// `funnel_only`. A null rule is `true` -- no rule means unreadable, not
+// unfetchable, and those are different refusals with different owners.
+//
+// The caller checks this BEFORE fetching. A funnel fetch costs the user a
+// recorded visit from their exit address and returns no information, which is
+// the worst trade in the program.
+bool rule_verifiable(const PageRule* r);
 
 // Days since `reviewed`, or -1 when unreviewed or either date is unusable.
 int  rule_age_days(const PageRule& r, const std::string& today);
@@ -175,10 +202,27 @@ enum class PageVerdict {
     NoResponse,     // the fetch produced nothing at all
     HttpDead,       // 404 / 410. Gone, or the slug was retired. Ambiguous BY
                     // NATURE and never a removal -- see Case::clean_absences.
-    HttpBlocked,    // 401 / 403: bot wall
+    HttpBlocked,    // 401 / 403, and the wall did not say whose fault it is
     HttpThrottled,  // 429
     HttpServerError,// 5xx
-    HttpUnexpected  // anything else, including an unfollowed redirect
+    HttpUnexpected, // anything else, including an unfollowed redirect
+
+    // ── The attributed walls (s15) ───────────────────────────────────────────
+    // A 401/403 whose own body names what it refused. These are OURS, not
+    // theirs, and so they do NOT bump the failure streak -- a broker that walls
+    // our exit forever would otherwise accumulate a streak indistinguishable
+    // from a listing quietly dying, and argue a live case toward Abandoned on
+    // the strength of a configuration choice the user made in ten seconds.
+    //
+    // The bar for producing either of these is the wall's own words. See
+    // `refusal_attribute()`.
+    HttpBlockedEgress,  // refused the address: VPN / datacenter / geo
+    HttpBlockedClient,  // refused the client shape: JS required, bot check
+
+    // Not a failure at all. The broker has no page to check, declared by a
+    // human in the rule -- see `PageRule::funnel_only`. Produced without a
+    // fetch, and the only verdict here that is nobody's bug.
+    FunnelOnly
 };
 
 const char* page_verdict_name(PageVerdict v);
@@ -208,6 +252,30 @@ bool page_verdict_is_clean(PageVerdict v);
 PageVerdict page_check(const PageRule* rule, int status, const std::string& body,
                        const PageNeedles& needles = {});
 
+// ── Reading the wall's own words ─────────────────────────────────────────────
+// Given the body of a 401/403, decide whether the wall said WHAT it refused.
+// Returns `HttpBlockedEgress`, `HttpBlockedClient`, or plain `HttpBlocked` when
+// it said nothing usable -- which is the common case and the correct default.
+//
+// This is the one place the app reads a page it was not looking for. `page_check`
+// refuses to run listing markers over a 403 body, and is right to: that is
+// someone else's page and a "no results" string on a bot wall would be read as
+// a removal. But the wall is a perfectly good witness ABOUT ITSELF, and
+// throwing its explanation away is what made three different problems look like
+// one for a whole session.
+//
+// Substring matching over normalised text, same as everything else in this
+// file, and for the same reason: this input arrives from the network, and a
+// backtracking regex over hostile bytes is an attack surface, not a feature.
+//
+// The phrase sets are deliberately small and generic. They are the wall's
+// vocabulary, not any one vendor's -- a list of product names would rot on
+// every rebrand, and a wall that has to explain itself to a human tends to use
+// the same dozen words whoever built it. When in doubt the set stays short:
+// a missed attribution costs one `Blocked`, and a wrong one sends the user to
+// change exits over a header problem.
+PageVerdict refusal_attribute(const std::string& body);
+
 // ── The seam to the caseload ─────────────────────────────────────────────────
 // What this verdict means in the vocabulary a case stores. `Absent` and
 // `NeedleAbsent` are the only two that produce NotFound; every refusal produces
@@ -235,5 +303,24 @@ Case apply_page_verdict(const Case& c, PageVerdict v, const std::string& today,
 // maintenance queue, and the honest denominator for any "N listings verified"
 // claim the report makes.
 std::vector<const Case*> caseload_unverifiable(const Caseload& c);
+
+// ── Cases behind a wall, and cases with no wall to get behind ────────────────
+// Split out of the maintenance queue on purpose. `caseload_unverifiable()` is
+// the list a MAINTAINER works: a rule is missing or has rotted, and writing one
+// fixes it. Neither of these is that list.
+//
+// Walled: the last check was refused by the far end. Nothing here is evidence
+// about the listing, and the report must not count these as "checked". Sorted
+// into who can act by reading `Case::reason`: `EgressBlocked` is the user's to
+// fix, `ClientBlocked` is ours, `Blocked` is nobody's until we learn more.
+std::vector<const Case*> caseload_walled(const Caseload& c);
+
+// Unverifiable BY CONSTRUCTION: the broker publishes no page a fetch can read.
+// These never leave this list by being retried, and the report owes the user a
+// different sentence for them -- not "we could not check yet" but "this one
+// cannot be checked, and filing is the only lever you have here". The honest
+// numerator problem in reverse: every "N of M verified" claim has to exclude
+// these from M or it is quietly blaming itself for a broker's design.
+std::vector<const Case*> caseload_unverifiable_by_design(const Caseload& c);
 
 }  // namespace delr::core

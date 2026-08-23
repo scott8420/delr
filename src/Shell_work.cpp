@@ -38,12 +38,21 @@
 // trips, which nobody will notice. A run over fifty listings will, and that is
 // the session that gets to reopen this.
 //
-// ── No needles yet ───────────────────────────────────────────────────────────
-// `PageNeedles` comes from the profile, which is s9-s10. Until then it is
-// empty, so a rule with `needs_needle` returns `NoNeedles` -- Indeterminate,
-// never NotFound, and straight into the maintenance queue. That is the honest
-// state: those brokers cannot be verified yet, and the window says so rather
-// than counting them as clean.
+// ── The needles, at last ─────────────────────────────────────────────────────
+// This comment said "the profile, which is s9-s10" and then went on saying it
+// through s13. It is s14 and the profile exists, so `PageNeedles` is now
+// derived from it -- see `core::needles_for`, which is where the decisions
+// about WHICH terms may confirm a page live.
+//
+// Derived at job start on the main thread and copied into the slot, not read
+// from `m_profile` on the worker. The form can be edited and saved while a
+// check is in flight, and a check should be judged against the profile it
+// STARTED with rather than one that changed underneath it -- the same
+// reasoning that copies the page rule rather than pointing at it.
+//
+// An EMPTY profile still yields `NoNeedles` -- Indeterminate, never NotFound,
+// straight into the maintenance queue. That remains the honest state, and it
+// is now a state the user can leave.
 // ─────────────────────────────────────────────────────────────────────────────
 #include "Shell.hpp"
 #include "Log.hpp"
@@ -114,6 +123,9 @@ void Shell::start_check(const core::Case& k) {
     m_job_case_id = k.id;
     m_job_url     = k.url;          // PII, and the reason this member is cleared below
     m_job_policy  = m_egress;
+    // PII too, and cleared on landing alongside the url. The profile's own
+    // terms, shaped for a substring matcher by core::needles_for.
+    m_job_needles = core::needles_for(m_profile);
 
     // The rule is copied INTO the job rather than pointed at: `m_rules` can be
     // reloaded from the menu while a check is in flight, and a pointer into a
@@ -158,7 +170,7 @@ void Shell::start_check(const core::Case& k) {
         // Judged here, on the worker, so `r.body` never leaves this frame.
         if (!m_job_ours)
             m_job_page = core::page_check(m_job_has_rule ? &m_job_rule : nullptr,
-                                          r.status, r.body, core::PageNeedles{});
+                                          r.status, r.body, m_job_needles);
 
         m_check_done.emit();
     });
@@ -169,6 +181,7 @@ void Shell::on_check_done() {
     m_checking = false;
     if (m_check_worker.joinable()) m_check_worker.join();
     m_job_url.clear();     // PII: held only as long as the fetch needed it
+    m_job_needles = core::PageNeedles{};   // and the user's own terms with it
 
     auto lg = log::get(log::Area::Cases);
 

@@ -23,6 +23,11 @@ add_library(delr_core STATIC
     src/core/RosterImport.cpp
     # Table two: the caseload. PII, unlike the roster -- see the header.
     src/core/Case.cpp
+    # Table four: the user. The first of the six things Scott said the app
+    # does, and the one every earlier session assumed -- PageNeedles has said
+    # "filled from the profile (not built yet)" since s8. Pure: a search key,
+    # a needle derivation, and a pump. It decides nothing about a display.
+    src/core/Profile.cpp
     # The paste-a-URL path: parse, match, mint, commit. Everything between a
     # pasted URL and a row in the caseload that can be decided without a
     # display -- which is all of it.
@@ -36,6 +41,12 @@ add_library(delr_core STATIC
     # schedule rather than a company's -- so it is its own file, its own
     # version, and its own review cadence.
     src/core/PageRules.cpp
+    # Table five: the run history. Append-only, NDJSON, never rewritten --
+    # `core/Case` holds the LAST check and has said since s8 that the history
+    # was "a separate concern and deliberately not modelled yet", while the
+    # same header called that history "the evidence, and this app exists
+    # because nobody else keeps it". This file closes the gap.
+    src/core/Journal.cpp
     # The pure half of the observer: everything between the bytes a syscall
     # hands back and the observation Egress judges. The syscalls themselves
     # land above this library; what their output MEANS is decided here, where

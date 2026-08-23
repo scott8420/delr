@@ -70,6 +70,19 @@ std::string egress_file() {
     return join(state_dir(), "egress.json");
 }
 
+std::string profile_file() {
+    if (const char* e = env_or_null("DELR_PROFILE")) return e;
+    return join(state_dir(), "profile.json");
+}
+
+std::string journal_file() {
+    if (const char* e = env_or_null("DELR_JOURNAL")) return e;
+    // `.ndjson`, not `.json`, and the extension is load-bearing rather than
+    // decorative: a tool that opens this as JSON gets a parse error on line
+    // two instead of a plausible-looking first record.
+    return join(state_dir(), "journal.ndjson");
+}
+
 bool ensure_state_dir(std::string* error) {
     const std::string dir = state_dir();
     if (dir.empty()) {

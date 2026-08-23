@@ -69,7 +69,7 @@ enum class Outcome {
 enum class Reason {
     None,
     NoTunnel,      // egress preflight refused -- we declined to expose ourselves
-    Blocked,       // 403 / bot wall
+    Blocked,       // a wall, and it did not say whose. See the note below.
     Captcha,
     RateLimited,
     Timeout,
@@ -81,7 +81,35 @@ enum class Reason {
     // See core/PageRules -- neither one bumps the failure streak, because a
     // rule we cannot read with is not evidence about the listing.
     NoRule,        // no page rule for this broker: fetchable, unreadable
-    PageUnreadable // a rule exists and did not fit the page it was given
+    PageUnreadable,// a rule exists and did not fit the page it was given
+
+    // ── The three walls, named apart (s15) ───────────────────────────────────
+    // The first live checks against real brokers hit three refusals that a
+    // single `Blocked` rendered identically, and they are not the same event.
+    // They differ in WHO CAN FIX THEM, which is the only axis a refusal value
+    // is for -- the same reason `NoRule` and `PageUnreadable` were split.
+    //
+    //   EgressBlocked -- the wall refused the ADDRESS. The user fixes it: a
+    //                    different exit, a different city. Actionable, today.
+    //   ClientBlocked -- the wall refused the CLIENT SHAPE. A browser through
+    //                    the same tunnel gets through. THE APP fixes it; the
+    //                    user cannot, and telling them to change exits wastes
+    //                    their afternoon.
+    //   NoListingPage -- the broker publishes no stable per-person page at all,
+    //                    only a lead-capture funnel. NOBODY fixes it. There is
+    //                    no rule that could work and no exit that would help,
+    //                    and a case sitting in the maintenance queue waiting
+    //                    for one is a promise the app cannot keep.
+    //
+    // `Blocked` SURVIVES and is the default, deliberately. A bare 403 that does
+    // not say why is exactly that: a wall, unattributed. Attribution requires
+    // evidence -- the wall's own words -- and guessing between these three from
+    // a status code would be the app inventing a diagnosis. Fail closed here
+    // too: an unattributed wall is honest, a wrong attribution sends the user
+    // to fix something that was never broken.
+    EgressBlocked,
+    ClientBlocked,
+    NoListingPage
 };
 
 // ── What this listing exposes ────────────────────────────────────────────────

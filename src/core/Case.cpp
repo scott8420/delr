@@ -85,6 +85,9 @@ const char* reason_name(Reason r) {
         case Reason::UrlDead:     return "url-dead";
         case Reason::NoRule:         return "no-rule";
         case Reason::PageUnreadable: return "page-unreadable";
+        case Reason::EgressBlocked:  return "egress-blocked";
+        case Reason::ClientBlocked:  return "client-blocked";
+        case Reason::NoListingPage:  return "no-listing-page";
     }
     return "none";
 }
@@ -99,6 +102,9 @@ Reason reason_from(const std::string& s) {
     if (s == "url-dead")     return Reason::UrlDead;
     if (s == "no-rule")         return Reason::NoRule;
     if (s == "page-unreadable") return Reason::PageUnreadable;
+    if (s == "egress-blocked")  return Reason::EgressBlocked;
+    if (s == "client-blocked")  return Reason::ClientBlocked;
+    if (s == "no-listing-page") return Reason::NoListingPage;
     return Reason::None;
 }
 

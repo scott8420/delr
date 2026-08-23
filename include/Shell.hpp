@@ -7,6 +7,7 @@
 #include "core/Egress.hpp"
 #include "core/Intake.hpp"
 #include "core/PageRules.hpp"
+#include "core/Profile.hpp"
 #include "net/Fetch.hpp"
 
 #include <gtkmm/applicationwindow.h>
@@ -60,6 +61,7 @@ private:
     // ── zones ──────────────────────────────────────────────────────────────
     void build_shell();                       // category: zone: window + sidebar + stack
     void build_pages();                       // category: zone: roster + cases pages
+    void build_profile_page();                // category: zone: the person
     Glib::RefPtr<Gio::Menu> build_menu();     // category: zone: hamburger model
 
     // ── bindings ───────────────────────────────────────────────────────────
@@ -72,6 +74,8 @@ private:
     void on_reload_cases();                   // category: handler: re-read the caseload from disk
     void on_reload_rules();                   // category: handler: re-read the page rules from disk
     void on_reload_egress();                  // category: handler: re-read the tunnel policy
+    void on_reload_profile();                 // category: handler: re-read the profile and repaint the form
+    void on_save_profile();                   // category: handler: read the form, validate, write 0600
     void on_case_selected();                  // category: handler: a row was picked
     void on_egress_settings();                // category: handler: open the tunnel settings
     void on_egress_saved(core::EgressPolicy p);  // category: handler: persist + repaint
@@ -112,6 +116,8 @@ private:
     // The tunnel policy. Mode 0600 on disk, because it holds this machine's
     // own address -- see core/Egress's pump.
     std::string egress_file() const;
+    // The person. Mode 0600, under state, never in the tree -- see its pump.
+    std::string profile_file() const;
 
     // Today, as ISO "YYYY-MM-DD". Also UI-side, and for the same reason: the
     // core does date ARITHMETIC but never asks what day it is. A pure function
@@ -177,10 +183,64 @@ private:
     widgets::ScrolledWindow m_cases_scroll;
     widgets::ListBox        m_cases_list;
 
+    // ── Profile page: the person ────────────────────────────────────────────
+    // A caption, a scrolling multi-line box, one term per line. Grouped into a
+    // struct rather than fifteen loose members, because five fields that
+    // behave identically should be BUILT identically -- and because the next
+    // field this form grows should cost one line here, not three.
+    //
+    // The parse and the join are `core::terms_parse` / `terms_join`. This
+    // struct holds no opinion about what a term is: the surface decides
+    // nothing, and "one per line" is the only thing it knows.
+    struct TermBox {
+        widgets::Label          caption;
+        widgets::ScrolledWindow scroll;
+        widgets::TextView       view;
+        explicit TermBox(const std::string& id)
+            : caption(id + ".caption"), scroll(id + ".scroll"), view(id + ".view") {}
+        void build(const std::string& label, const std::string& hint);
+        std::string text() const;
+        void set_text(const std::string& s);
+    };
+
+    widgets::Box            m_profile_page;
+    widgets::Label          m_profile_lede;
+    // Scott, on the tunnel at s13: "I don't know how it really helps but I
+    // just thought it wise." He is right and the app never told him why, which
+    // means it has been asking for trust it did not earn. This label is the
+    // answer, and it is on THIS page because this is the page where a person
+    // types the things a check will carry to a broker.
+    widgets::Label          m_profile_tunnel;
+    widgets::Separator      m_profile_rule;
+    widgets::ScrolledWindow m_profile_scroll;
+    widgets::Box            m_profile_form;
+
+    widgets::Label          m_profile_name_caption;
+    widgets::Entry          m_profile_name;
+    TermBox                 m_profile_aka;
+    TermBox                 m_profile_emails;
+    widgets::Label          m_profile_contact_caption;
+    widgets::Entry          m_profile_contact;
+    TermBox                 m_profile_phones;
+    TermBox                 m_profile_usernames;
+    TermBox                 m_profile_places;
+    widgets::Label          m_profile_year_caption;
+    widgets::Entry          m_profile_year;
+
+    widgets::Box            m_profile_actions;
+    widgets::Button         m_profile_save;
+    // What is in the profile and what it is worth, plus anything the validator
+    // objected to. One line the user can read; never a value from the form.
+    widgets::Label          m_profile_status;
+
     // Core state (model side of the one real seam).
     core::Roster    m_roster;
     core::Caseload  m_caseload;
     core::PageRules m_rules;
+    // Loaded at startup, edited through the form, saved by the Shell -- the
+    // same shape as the egress policy. It is the app's answer to "is this
+    // listing mine", and until s14 that answer was always "cannot tell".
+    core::Profile   m_profile;
 
     // ── the job slot ───────────────────────────────────────────────────────
     // Written on the main thread before the worker starts, read by the worker,
@@ -204,6 +264,11 @@ private:
     core::Verdict           m_job_verdict = core::Verdict::Unconfigured;
     net::FetchError         m_job_error = net::FetchError::NotBuilt;
     bool                    m_job_ours  = true;   // pessimistic: nothing judged yet
+    // PII, like `m_job_url`, and cleared on landing for the same reason: these
+    // are the user's own identifiers, derived from the profile at the moment
+    // the job starts and thrown away with the fetch. They are never persisted
+    // with a case and never logged.
+    core::PageNeedles       m_job_needles;
     core::PageVerdict       m_job_page  = core::PageVerdict::NoResponse;
     long                    m_job_ms    = 0;
 

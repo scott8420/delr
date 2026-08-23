@@ -69,7 +69,10 @@ private:
     void select_broker(const std::string& id);   // programmatic, guarded
 
     widgets::Box   m_root, m_broker_row, m_buttons;
-    widgets::Label m_prompt, m_verdict, m_broker_label, m_exposes_label;
+    widgets::Label m_prompt, m_broker_label, m_exposes_label;
+    // What the intake made of the URL you pasted -- the one line in this dialog
+    // the app produced rather than printed.
+    widgets::Reported m_verdict;
     widgets::Entry m_url, m_note;
     widgets::DropDown m_broker;
     widgets::FlowBox  m_exposes;

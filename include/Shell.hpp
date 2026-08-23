@@ -181,7 +181,7 @@ private:
     widgets::Box            m_roster_page;
     widgets::Label          m_roster_lede;
     widgets::Label          m_roster_how;
-    widgets::Label          m_roster_status;
+    widgets::Reported       m_roster_status;
     widgets::Separator      m_roster_rule;
     widgets::ScrolledWindow m_roster_scroll;
     widgets::ListBox        m_roster_list;
@@ -191,8 +191,8 @@ private:
     // The tunnel's state, above everything else on this page. s8 puts the
     // check button here, and a page offering to check with no tunnel
     // configured would be offering something that cannot happen.
-    widgets::Label          m_egress_status;
-    widgets::Label          m_cases_status;
+    widgets::Reported       m_egress_status;
+    widgets::Reported       m_cases_status;
     widgets::Label          m_cases_exposure;
     // The maintenance queue: listings we fetched and could not READ. Its own
     // line rather than a footnote in the status, because it is the honest
@@ -202,7 +202,7 @@ private:
     // SELECTED row: one case checked deliberately, not a run.
     widgets::Box            m_check_row;
     widgets::Button         m_check_button;
-    widgets::Label          m_check_state;
+    widgets::Reported       m_check_state;
     widgets::ScrolledWindow m_cases_scroll;
     widgets::ListBox        m_cases_list;
 
@@ -254,7 +254,7 @@ private:
     widgets::Button         m_profile_save;
     // What is in the profile and what it is worth, plus anything the validator
     // objected to. One line the user can read; never a value from the form.
-    widgets::Label          m_profile_status;
+    widgets::Reported       m_profile_status;
 
     // Core state (model side of the one real seam).
     core::Roster    m_roster;

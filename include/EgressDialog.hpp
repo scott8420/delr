@@ -203,16 +203,25 @@ private:
                    m_resolver_row, m_ttl_row, m_exits_head, m_baseline_row,
                    m_preflight_row, m_echo_row, m_canary_row, m_devs_row,
                    m_buttons;
-    widgets::Label m_intro, m_iface_label, m_iface_live, m_devs_label, m_devs_note, m_dns_label, m_dns_note,
-                   m_proxy_label, m_proxy_state, m_resolver_label, m_resolver_note,
-                   m_ttl_label, m_exits_label, m_baseline_label, m_baseline_state,
-                   m_resolver_state, m_endpoints_label, m_echo_label, m_canary_label,
-                   m_endpoints_note, m_report, m_verdict, m_problems,
-                   // The three step headings, and the three LOCAL sinks that go
-                   // with them. See the block above about where a sentence has
-                   // to land.
-                   m_step1, m_step2, m_step3,
-                   m_baseline_say, m_iface_say, m_exits_say;
+    widgets::Label m_intro, m_iface_label, m_devs_label, m_devs_note,
+                   m_dns_label, m_dns_note,
+                   m_proxy_label, m_resolver_label, m_resolver_note,
+                   m_ttl_label, m_exits_label, m_baseline_label,
+                   m_endpoints_label, m_echo_label, m_canary_label,
+                   m_endpoints_note,
+                   // The three step headings. Chrome: they name a step, they do
+                   // not report one.
+                   m_step1, m_step2, m_step3;
+
+    // Everything the preflight OBSERVED, and therefore everything a user might
+    // need to paste somewhere. This window is the one that produces the
+    // sentences hardest to retype -- an interface name, a verdict, a list of
+    // problems -- and it was the one where none of them could be copied.
+    widgets::Reported m_iface_live, m_proxy_state, m_baseline_state,
+                      m_resolver_state, m_report, m_verdict, m_problems,
+                      // The three LOCAL sinks that go with the step headings.
+                      // See the block above about where a sentence has to land.
+                      m_baseline_say, m_iface_say, m_exits_say;
     widgets::Entry m_iface, m_devs, m_proxy, m_resolver, m_ttl, m_baseline_iface,
                    m_echo_url, m_canary_url;
     widgets::DropDown       m_dns;
